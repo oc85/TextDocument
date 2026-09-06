@@ -1,56 +1,83 @@
 # ============================================================
-# CHEMISTRY DOCUMENT DETECTION + OCR INSPECTION TOOL
-# UPDATED FOR 6-CLASS MODEL
+# CHEMICAL DOCUMENT YOLO + OCR INSPECTION VIEWER
 #
-# MODEL:
-# D:\Kaggle\WRtools_003\best.pt
+# FEATURES
+# ------------------------------------------------------------
+# - PDF / image viewer
+# - Modern PyMuPDF import: import pymupdf
+# - Automatic Fit Page
+# - Fit Width
+# - Mouse-wheel zoom AT cursor
+# - Left mouse drag = pan document
+# - Shift + mouse wheel = horizontal movement
+# - Previous / next PDF page
+# - YOLO detection
+# - EasyOCR
+# - Manual OCR mapping dictionaries near TOP of code
+# - Raw OCR + corrected OCR in result table
+# - Clean non-obstructive OCR overlay
+# - Show / Hide overlay
+# - Click result row -> move to detection
 #
-# CLASSES:
-# 0: element_symbol
-# 1: element_value
-# 2: unit
-# 3: limit_indicator
-# 4: value_range
-# 5: sign
+# IMPORTANT VALUE RECOGNITION
+# ------------------------------------------------------------
+# element_value can contain:
 #
-# OCR:
-# EasyOCR
-# padded crops
-# multi-pass preprocessing
-# class-specific allowlists
-# chemistry-aware cleanup
+#   0.10
+#   5.4
+#   3.20
+#   -
+#   Bal
+#   Balance
+#   Trace
+#
+# Therefore:
+#
+#   1. numeric OCR is performed
+#   2. text OCR is also performed
+#   3. known mapped text such as Bal has priority
+#   4. otherwise valid numeric result wins
+#   5. then real dash
+#   6. then unknown text
+#
+# CURRENT YOLO CLASSES:
+#
+# 0 element_symbol
+# 1 element_value
+# 2 unit
+# 3 limit_indicator
+# 4 value_range
+# 5 sign
+#
 # ============================================================
 
-import os
 import re
-import fitz
-import cv2
-import numpy as np
-import tkinter as tk
+import threading
+from pathlib import Path
 
+import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+import cv2
+import easyocr
+import numpy as np
+import pymupdf
+import torch
+
 from PIL import Image, ImageTk
 from ultralytics import YOLO
 
-import easyocr
-import torch
-
 
 # ============================================================
-# SETTINGS
+# 1. MAIN SETTINGS
 # ============================================================
 
-MODEL_PATH = r"D:\Kaggle\WRtools_003\best.pt"
-
-
-# ------------------------------------------------------------
-# YOLO SETTINGS
-# ------------------------------------------------------------
+MODEL_PATH = Path(
+    r"D:\Kaggle\WRtools_003\best.pt"
+)
 
 IMAGE_SIZE = 1280
 
-# Low threshold because this is an inspection tool.
-# We want to see weaker detections too.
 CONFIDENCE = 0.03
 
 IOU_THRESHOLD = 0.45
@@ -59,182 +86,403 @@ MAX_DETECTIONS = 2000
 
 PDF_DPI = 300
 
-DEVICE = 0 if torch.cuda.is_available() else "cpu"
+DEVICE = (
+    0
+    if torch.cuda.is_available()
+    else "cpu"
+)
+
+
+# ============================================================
+# 2. EXPECTED YOLO CLASSES
+# ============================================================
+
+EXPECTED_CLASSES = {
+    0: "element_symbol",
+    1: "element_value",
+    2: "unit",
+    3: "limit_indicator",
+    4: "value_range",
+    5: "sign",
+}
+
+
+# ============================================================
+# 3. MANUAL OCR MAPPINGS
+#
+# EDIT THESE WHEN YOU FIND REPEATING OCR ERRORS.
+#
+# LEFT  = OCR result / mistake
+# RIGHT = final corrected value
+#
+# Mapping lookup is case-insensitive.
+# ============================================================
 
 
 # ------------------------------------------------------------
-# OCR SETTINGS
+# ELEMENT SYMBOL MAPPING
 # ------------------------------------------------------------
 
-OCR_SCALE = 5.0
+ELEMENT_MAPPING = {
 
-# Relative padding around YOLO boxes
-OCR_PAD_X = 0.15
-OCR_PAD_Y = 0.25
+    # Aluminium
+    "al": "Al",
+    "a1": "Al",
+    "ai": "Al",
+    "a|": "Al",
 
-# Minimum source-image padding
-OCR_MIN_PAD_X = 4
-OCR_MIN_PAD_Y = 3
+    # Boron
+    "b": "B",
 
-# Ignore extremely weak OCR candidates
-OCR_MIN_CONFIDENCE = 0.05
+    # Carbon
+    "c": "C",
+
+    # Cadmium
+    "cd": "Cd",
+    "cb": "Cd",
+
+    # Chromium
+    "cr": "Cr",
+    "gr": "Cr",
+    "c r": "Cr",
+
+    # Cobalt
+    "co": "Co",
+    "c0": "Co",
+
+    # Copper
+    "cu": "Cu",
+
+    # Iron
+    "fe": "Fe",
+    "f e": "Fe",
+
+    # Hafnium
+    "hf": "Hf",
+
+    # Manganese
+    "mn": "Mn",
+
+    # Molybdenum
+    "mo": "Mo",
+    "m0": "Mo",
+
+    # Niobium
+    "nb": "Nb",
+
+    # Nickel
+    "ni": "Ni",
+    "nl": "Ni",
+    "n1": "Ni",
+
+    # Phosphorus
+    "p": "P",
+
+    # Lead
+    "pb": "Pb",
+
+    # Rhenium
+    "re": "Re",
+
+    # Sulfur
+    "s": "S",
+
+    # Silicon
+    "si": "Si",
+    "sl": "Si",
+
+    # Tin
+    "sn": "Sn",
+
+    # Tantalum
+    "ta": "Ta",
+
+    # Titanium
+    "ti": "Ti",
+
+    # Vanadium
+    "v": "V",
+
+    # Tungsten
+    "w": "W",
+    "vv": "W",
+
+    # Zirconium
+    "zr": "Zr",
+
+    # Silver
+    "ag": "Ag",
+
+    # Bismuth
+    "bi": "Bi",
+}
+
+
+# ------------------------------------------------------------
+# UNIT MAPPING
+# ------------------------------------------------------------
+
+UNIT_MAPPING = {
+
+    "%": "%",
+
+    "percent": "%",
+    "percentage": "%",
+    "0/0": "%",
+    "o/o": "%",
+
+    "ppm": "ppm",
+    "prm": "ppm",
+    "ppn": "ppm",
+    "pom": "ppm",
+    "prn": "ppm",
+
+    "ppb": "ppb",
+
+    "wt%": "wt%",
+    "wt.%": "wt%",
+}
+
+
+# ------------------------------------------------------------
+# LIMIT INDICATOR MAPPING
+# ------------------------------------------------------------
+
+LIMIT_MAPPING = {
+
+    "max": "MAX",
+    "maximum": "MAX",
+    "rnax": "MAX",
+    "rnaximum": "MAX",
+    "m4x": "MAX",
+
+    "min": "MIN",
+    "minimum": "MIN",
+    "rnin": "MIN",
+    "rninimum": "MIN",
+}
+
+
+# ------------------------------------------------------------
+# SIGN MAPPING
+# ------------------------------------------------------------
+
+SIGN_MAPPING = {
+
+    "<": "<",
+    "‹": "<",
+    "≤": "<=",
+    "<=": "<=",
+
+    ">": ">",
+    "›": ">",
+    "≥": ">=",
+    ">=": ">=",
+}
+
+
+# ------------------------------------------------------------
+# SPECIAL ELEMENT VALUE MAPPING
+#
+# IMPORTANT:
+# Add recurring text values here.
+#
+# Example:
+# OCR sees "Bai" -> final should be "Bal"
+# ------------------------------------------------------------
+
+VALUE_MAPPING = {
+
+    "-": "-",
+    "–": "-",
+    "—": "-",
+    "−": "-",
+
+    "bal": "Bal",
+    "bai": "Bal",
+    "ba1": "Bal",
+    "bal.": "Bal",
+
+    "balance": "Balance",
+    "banch": "Banch",
+
+    "trace": "Trace",
+}
+
+
+# ------------------------------------------------------------
+# RANGE MAPPING
+# ------------------------------------------------------------
+
+RANGE_MAPPING = {
+
+    "–": "-",
+    "—": "-",
+    "−": "-",
+}
 
 
 # ============================================================
-# EXPECTED MODEL CLASSES
+# 4. VALID ELEMENTS
 # ============================================================
 
-EXPECTED_CLASSES = [
-    "element_symbol",
-    "element_value",
-    "unit",
-    "limit_indicator",
-    "value_range",
-    "sign",
-]
+VALID_ELEMENTS = {
+    "Ag",
+    "Al",
+    "B",
+    "Bi",
+    "C",
+    "Cd",
+    "Co",
+    "Cr",
+    "Cu",
+    "Fe",
+    "Hf",
+    "Mn",
+    "Mo",
+    "Nb",
+    "Ni",
+    "P",
+    "Pb",
+    "Re",
+    "S",
+    "Sb",
+    "Si",
+    "Sn",
+    "Ta",
+    "Ti",
+    "V",
+    "W",
+    "Zr",
+}
 
 
 # ============================================================
-# OCR ALLOWLISTS
+# 5. OCR SETTINGS
 # ============================================================
 
-OCR_ALLOWLISTS = {
+OCR_SCALE = 4.0
 
-    # Chemical symbols: Cr, Ni, Fe, Mo etc.
+# General classes
+OCR_PAD_X = 0.12
+OCR_PAD_Y = 0.16
+
+# Numeric values:
+# Keep vertical padding small so table lines don't enter crop.
+VALUE_PAD_X = 0.08
+VALUE_PAD_Y = 0.04
+
+# Ranges
+RANGE_PAD_X = 0.08
+RANGE_PAD_Y = 0.05
+
+OCR_MIN_CONFIDENCE = 0.15
+
+
+# ============================================================
+# 6. OVERLAY SETTINGS
+# ============================================================
+
+SHOW_OVERLAY = True
+
+SHOW_OVERLAY_TEXT = True
+
+SHOW_CLASS_PREFIX = True
+
+OVERLAY_BOX_THICKNESS = 1
+
+OVERLAY_FONT_SCALE = 0.34
+
+OVERLAY_FONT_THICKNESS = 1
+
+OVERLAY_TEXT_PADDING = 3
+
+OVERLAY_LABEL_ALPHA = 0.58
+
+OVERLAY_MAX_TEXT_LENGTH = 22
+
+
+# ============================================================
+# 7. DISPLAY COLOURS
+# ============================================================
+
+CLASS_COLOURS = {
+
     "element_symbol":
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+        (215, 50, 50),
 
-    # Numeric value only
     "element_value":
-        "0123456789.,+-",
+        (255, 140, 0),
 
-    # %, ppm, wt%, etc.
     "unit":
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz%/.",
+        (30, 170, 60),
 
-    # MAX, MIN, Maximum, Minimum etc.
     "limit_indicator":
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+        (145, 70, 200),
 
-    # 18-20, 0.05-0.10, 18 to 20 etc.
     "value_range":
-        "0123456789.,+-–—",
+        (220, 40, 160),
 
-    # < > <= >= ≤ ≥
     "sign":
-        "<>=≤≥",
+        (40, 120, 220),
+}
 
+
+CLASS_SHORT = {
+
+    "element_symbol": "E",
+
+    "element_value": "V",
+
+    "unit": "U",
+
+    "limit_indicator": "L",
+
+    "value_range": "R",
+
+    "sign": "S",
 }
 
 
 # ============================================================
-# VALID CHEMICAL ELEMENT SYMBOLS
+# HELPER FUNCTIONS
 # ============================================================
 
-CHEMICAL_ELEMENTS = {
-    "H", "He",
-    "Li", "Be", "B", "C", "N", "O", "F", "Ne",
-    "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar",
-    "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn", "Fe",
-    "Co", "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se",
-    "Br", "Kr", "Rb", "Sr", "Y", "Zr", "Nb", "Mo",
-    "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In", "Sn",
-    "Sb", "Te", "I", "Xe", "Cs", "Ba", "La", "Ce",
-    "Pr", "Nd", "Pm", "Sm", "Eu", "Gd", "Tb", "Dy",
-    "Ho", "Er", "Tm", "Yb", "Lu", "Hf", "Ta", "W",
-    "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl", "Pb",
-    "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th",
-    "Pa", "U", "Np", "Pu"
-}
+def clean_text(value):
 
+    value = str(value)
 
-# ============================================================
-# LOAD YOLO
-# ============================================================
-
-print("=" * 70)
-print("LOADING YOLO MODEL")
-print("=" * 70)
-
-print("Model:")
-print(MODEL_PATH)
-
-if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(
-        f"YOLO model not found:\n{MODEL_PATH}"
+    value = value.replace(
+        "\n",
+        " "
     )
 
-model = YOLO(MODEL_PATH)
-
-print("\nYOLO loaded successfully.")
-
-print("\nModel classes:")
-print("-" * 70)
-
-for class_id, class_name in model.names.items():
-    print(f"{class_id}: {class_name}")
-
-print("-" * 70)
+    return re.sub(
+        r"\s+",
+        " ",
+        value
+    ).strip()
 
 
-# ============================================================
-# VERIFY CLASS STRUCTURE
-# ============================================================
+def mapping_key(text):
 
-actual_classes = [
-    model.names[i]
-    for i in sorted(model.names.keys())
-]
-
-if actual_classes != EXPECTED_CLASSES:
-
-    print("\nWARNING:")
-    print("Model classes do not exactly match expected classes.")
-
-    print("\nExpected:")
-    for i, name in enumerate(EXPECTED_CLASSES):
-        print(f"  {i}: {name}")
-
-    print("\nModel:")
-    for i, name in model.names.items():
-        print(f"  {i}: {name}")
-
-else:
-    print("\n✓ Model class structure is correct.")
+    return clean_text(
+        text
+    ).lower()
 
 
-# ============================================================
-# LOAD EASYOCR
-# ============================================================
+def apply_mapping(
+    text,
+    mapping
+):
 
-print("\n" + "=" * 70)
-print("LOADING EASYOCR")
-print("=" * 70)
-
-OCR_GPU = torch.cuda.is_available()
-
-print("CUDA available:", torch.cuda.is_available())
-print("EasyOCR GPU    :", OCR_GPU)
-
-try:
-
-    ocr_reader = easyocr.Reader(
-        ["en"],
-        gpu=OCR_GPU
+    key = mapping_key(
+        text
     )
 
-except Exception as error:
-
-    print("\nEasyOCR GPU initialization failed.")
-    print("Reason:", error)
-    print("Falling back to CPU...")
-
-    ocr_reader = easyocr.Reader(
-        ["en"],
-        gpu=False
+    return mapping.get(
+        key
     )
-
-print("EasyOCR loaded successfully.")
 
 
 # ============================================================
@@ -243,12 +491,18 @@ print("EasyOCR loaded successfully.")
 
 def load_image_rgb(path):
 
-    image = cv2.imread(
-        path,
+    data = np.fromfile(
+        str(path),
+        dtype=np.uint8
+    )
+
+    image = cv2.imdecode(
+        data,
         cv2.IMREAD_COLOR
     )
 
     if image is None:
+
         raise ValueError(
             f"Could not open image:\n{path}"
         )
@@ -260,39 +514,44 @@ def load_image_rgb(path):
 
 
 # ============================================================
-# PDF PAGE -> RGB
+# PDF PAGE -> RGB IMAGE
 # ============================================================
 
 def pdf_page_to_rgb(
     pdf_path,
-    page_number=0,
+    page_number,
     dpi=PDF_DPI
 ):
 
-    document = fitz.open(pdf_path)
+    with pymupdf.open(
+        str(pdf_path)
+    ) as document:
 
-    try:
+        if document.page_count == 0:
 
-        if len(document) == 0:
             raise ValueError(
-                "PDF contains no pages."
+                "The PDF contains no pages."
             )
 
         page_number = max(
             0,
             min(
                 page_number,
-                len(document) - 1
+                document.page_count - 1
             )
         )
 
-        page = document[page_number]
+        page = document[
+            page_number
+        ]
 
-        zoom = dpi / 72.0
+        scale = (
+            dpi / 72.0
+        )
 
-        matrix = fitz.Matrix(
-            zoom,
-            zoom
+        matrix = pymupdf.Matrix(
+            scale,
+            scale
         )
 
         pix = page.get_pixmap(
@@ -312,956 +571,1309 @@ def pdf_page_to_rgb(
         )
 
         if pix.n == 4:
+
             image = cv2.cvtColor(
                 image,
                 cv2.COLOR_RGBA2RGB
             )
 
-        return image
-
-    finally:
-        document.close()
+        return image.copy()
 
 
 # ============================================================
-# BASIC OCR TEXT CLEANUP
+# PAD DETECTION CROP
 # ============================================================
 
-def clean_ocr_text(text):
-
-    text = str(text).strip()
-
-    text = text.replace(
-        "\n",
-        " "
-    )
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
-
-    return text.strip()
-
-
-# ============================================================
-# LEVENSHTEIN
-# ============================================================
-
-def levenshtein(a, b):
-
-    a = str(a)
-    b = str(b)
-
-    if len(a) < len(b):
-        return levenshtein(
-            b,
-            a
-        )
-
-    if len(b) == 0:
-        return len(a)
-
-    previous_row = list(
-        range(
-            len(b) + 1
-        )
-    )
-
-    for i, char_a in enumerate(
-        a,
-        start=1
-    ):
-
-        current_row = [i]
-
-        for j, char_b in enumerate(
-            b,
-            start=1
-        ):
-
-            insertions = previous_row[j] + 1
-
-            deletions = current_row[j - 1] + 1
-
-            substitutions = (
-                previous_row[j - 1]
-                + (char_a != char_b)
-            )
-
-            current_row.append(
-                min(
-                    insertions,
-                    deletions,
-                    substitutions
-                )
-            )
-
-        previous_row = current_row
-
-    return previous_row[-1]
-
-
-# ============================================================
-# ELEMENT SYMBOL NORMALIZATION
-# ============================================================
-
-def normalize_element_symbol(text):
-
-    text = clean_ocr_text(text)
-
-    candidate = re.sub(
-        r"[^A-Za-z]",
-        "",
-        text
-    )
-
-    if not candidate:
-        return text
-
-    candidate = (
-        candidate[0].upper()
-        + candidate[1:].lower()
-    )
-
-    if candidate in CHEMICAL_ELEMENTS:
-        return candidate
-
-    # Do not aggressively correct long text
-    if len(candidate) > 3:
-        return candidate
-
-    closest = None
-    closest_distance = 999
-
-    for element in CHEMICAL_ELEMENTS:
-
-        distance = levenshtein(
-            candidate.lower(),
-            element.lower()
-        )
-
-        if distance < closest_distance:
-
-            closest = element
-            closest_distance = distance
-
-    if closest_distance <= 1:
-        return closest
-
-    return candidate
-
-
-# ============================================================
-# ELEMENT VALUE NORMALIZATION
-# ============================================================
-
-def normalize_numeric_text(text):
-
-    text = clean_ocr_text(text)
-
-    text = text.replace(
-        " ",
-        ""
-    )
-
-    replacements = {
-        "O": "0",
-        "o": "0",
-        "I": "1",
-        "l": "1",
-        "|": "1",
-
-        "−": "-",
-        "–": "-",
-        "—": "-",
-
-        ",": ".",
-    }
-
-    for old, new in replacements.items():
-        text = text.replace(
-            old,
-            new
-        )
-
-    # Element value should remain numeric
-    text = re.sub(
-        r"[^0-9.+\-]",
-        "",
-        text
-    )
-
-    # Remove duplicate decimal points
-    if text.count(".") > 1:
-
-        first = text.find(".")
-
-        text = (
-            text[:first + 1]
-            + text[first + 1:].replace(
-                ".",
-                ""
-            )
-        )
-
-    return text
-
-
-# ============================================================
-# RANGE NORMALIZATION
-# ============================================================
-
-def normalize_range_text(text):
-
-    text = clean_ocr_text(text)
-
-    text = text.replace(
-        " ",
-        ""
-    )
-
-    replacements = {
-        "O": "0",
-        "o": "0",
-        "I": "1",
-        "l": "1",
-        "|": "1",
-
-        "−": "-",
-        "–": "-",
-        "—": "-",
-
-        ",": ".",
-    }
-
-    for old, new in replacements.items():
-        text = text.replace(
-            old,
-            new
-        )
-
-    # Keep range-related characters
-    text = re.sub(
-        r"[^0-9.+\-]",
-        "",
-        text
-    )
-
-    return text
-
-
-# ============================================================
-# UNIT NORMALIZATION
-# ============================================================
-
-def normalize_unit_text(text):
-
-    original = clean_ocr_text(text)
-
-    normalized = (
-        original
-        .replace(" ", "")
-        .lower()
-    )
-
-    replacements = {
-        "pprn": "ppm",
-        "ppnn": "ppm",
-        "ppni": "ppm",
-        "pprm": "ppm",
-        "ppin": "ppm",
-        "wt.%": "wt%",
-        "wt %": "wt%",
-    }
-
-    if normalized in replacements:
-        return replacements[normalized]
-
-    if normalized == "ppm":
-        return "ppm"
-
-    if normalized == "ppb":
-        return "ppb"
-
-    if normalized in {
-        "%",
-        "wt%",
-        "wt.%",
-    }:
-        return normalized
-
-    if "%" in normalized:
-        return normalized
-
-    return original
-
-
-# ============================================================
-# LIMIT INDICATOR NORMALIZATION
-# ============================================================
-
-def normalize_limit_indicator(text):
-
-    original = clean_ocr_text(text)
-
-    cleaned = re.sub(
-        r"[^A-Za-z]",
-        "",
-        original
-    ).lower()
-
-    if not cleaned:
-        return original
-
-    max_variants = {
-        "max",
-        "maximum",
-        "maxima",
-        "mx",
-        "ma",
-    }
-
-    min_variants = {
-        "min",
-        "minimum",
-        "mn",
-        "mi",
-    }
-
-    if cleaned in max_variants:
-        return "MAX"
-
-    if cleaned in min_variants:
-        return "MIN"
-
-    # Fuzzy correction
-    if levenshtein(
-        cleaned,
-        "max"
-    ) <= 1:
-        return "MAX"
-
-    if levenshtein(
-        cleaned,
-        "min"
-    ) <= 1:
-        return "MIN"
-
-    if levenshtein(
-        cleaned,
-        "maximum"
-    ) <= 2:
-        return "MAX"
-
-    if levenshtein(
-        cleaned,
-        "minimum"
-    ) <= 2:
-        return "MIN"
-
-    return original.upper()
-
-
-# ============================================================
-# SIGN NORMALIZATION
-# ============================================================
-
-def normalize_sign_text(text):
-
-    text = clean_ocr_text(text)
-
-    text = (
-        text
-        .replace(" ", "")
-        .replace("≤", "<=")
-        .replace("≥", ">=")
-    )
-
-    # Common OCR confusions
-    replacements = {
-        "«": "<",
-        "‹": "<",
-        "＜": "<",
-        "›": ">",
-        "»": ">",
-        "＞": ">",
-    }
-
-    for old, new in replacements.items():
-        text = text.replace(
-            old,
-            new
-        )
-
-    if "<=" in text:
-        return "<="
-
-    if ">=" in text:
-        return ">="
-
-    if "<" in text:
-        return "<"
-
-    if ">" in text:
-        return ">"
-
-    if "=" in text:
-        return "="
-
-    return text
-
-
-# ============================================================
-# CLASS-AWARE OCR NORMALIZATION
-# ============================================================
-
-def normalize_by_class(
-    text,
-    class_name
+def padded_crop(
+    image,
+    detection
 ):
 
-    if not text:
-        return ""
+    x1 = detection["x1"]
+    y1 = detection["y1"]
 
-    if class_name == "element_symbol":
+    x2 = detection["x2"]
+    y2 = detection["y2"]
 
-        return normalize_element_symbol(
-            text
-        )
+    width = max(
+        1,
+        x2 - x1
+    )
+
+    height = max(
+        1,
+        y2 - y1
+    )
+
+    class_name = detection[
+        "class_name"
+    ]
 
     if class_name == "element_value":
 
-        return normalize_numeric_text(
-            text
-        )
+        pad_x_fraction = VALUE_PAD_X
+        pad_y_fraction = VALUE_PAD_Y
 
-    if class_name == "value_range":
+    elif class_name == "value_range":
 
-        return normalize_range_text(
-            text
-        )
-
-    if class_name == "unit":
-
-        return normalize_unit_text(
-            text
-        )
-
-    if class_name == "limit_indicator":
-
-        return normalize_limit_indicator(
-            text
-        )
-
-    if class_name == "sign":
-
-        return normalize_sign_text(
-            text
-        )
-
-    return clean_ocr_text(
-        text
-    )
-
-
-# ============================================================
-# PADDED CROP
-# ============================================================
-
-def get_padded_crop(
-    image,
-    box
-):
-
-    image_h, image_w = image.shape[:2]
-
-    x1 = int(box["x1"])
-    y1 = int(box["y1"])
-    x2 = int(box["x2"])
-    y2 = int(box["y2"])
-
-    box_w = max(
-        x2 - x1,
-        1
-    )
-
-    box_h = max(
-        y2 - y1,
-        1
-    )
-
-    # Signs are very small, so give them more relative padding
-    if box.get("class_name") == "sign":
-
-        pad_x_factor = 0.35
-        pad_y_factor = 0.40
+        pad_x_fraction = RANGE_PAD_X
+        pad_y_fraction = RANGE_PAD_Y
 
     else:
 
-        pad_x_factor = OCR_PAD_X
-        pad_y_factor = OCR_PAD_Y
+        pad_x_fraction = OCR_PAD_X
+        pad_y_fraction = OCR_PAD_Y
 
     pad_x = max(
-        OCR_MIN_PAD_X,
+        1,
         int(
-            box_w
-            * pad_x_factor
+            width
+            * pad_x_fraction
         )
     )
 
     pad_y = max(
-        OCR_MIN_PAD_Y,
+        1,
         int(
-            box_h
-            * pad_y_factor
+            height
+            * pad_y_fraction
         )
     )
 
-    x1_pad = max(
+    crop_x1 = max(
         0,
         x1 - pad_x
     )
 
-    y1_pad = max(
+    crop_y1 = max(
         0,
         y1 - pad_y
     )
 
-    x2_pad = min(
-        image_w,
+    crop_x2 = min(
+        image.shape[1],
         x2 + pad_x
     )
 
-    y2_pad = min(
-        image_h,
+    crop_y2 = min(
+        image.shape[0],
         y2 + pad_y
     )
 
-    crop = image[
-        y1_pad:y2_pad,
-        x1_pad:x2_pad
+    return image[
+        crop_y1:crop_y2,
+        crop_x1:crop_x2
     ]
 
-    return crop
-
 
 # ============================================================
-# CREATE OCR VARIANTS
+# OCR PREPROCESSING
 # ============================================================
 
-def create_ocr_variants(crop):
+def preprocess_variants(crop):
 
-    variants = []
+    if (
+        crop is None
+        or crop.size == 0
+    ):
 
-    if crop is None:
-        return variants
-
-    if crop.size == 0:
-        return variants
-
-    # --------------------------------------------------------
-    # UPSCALE
-    # --------------------------------------------------------
+        return []
 
     enlarged = cv2.resize(
+
         crop,
+
         None,
+
         fx=OCR_SCALE,
+
         fy=OCR_SCALE,
+
         interpolation=cv2.INTER_CUBIC
     )
 
-    variants.append(
-        (
-            "original",
-            enlarged
-        )
+    gray = cv2.cvtColor(
+        enlarged,
+        cv2.COLOR_RGB2GRAY
     )
 
-    # --------------------------------------------------------
-    # GRAYSCALE
-    # --------------------------------------------------------
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    ).apply(
+        gray
+    )
 
-    if len(enlarged.shape) == 3:
+    sharpen = cv2.addWeighted(
+
+        clahe,
+
+        1.6,
+
+        cv2.GaussianBlur(
+            clahe,
+            (0, 0),
+            1.0
+        ),
+
+        -0.6,
+
+        0
+    )
+
+    denoise = cv2.fastNlMeansDenoising(
+        sharpen,
+        None,
+        7,
+        7,
+        21
+    )
+
+    otsu = cv2.threshold(
+
+        denoise,
+
+        0,
+
+        255,
+
+        cv2.THRESH_BINARY
+        + cv2.THRESH_OTSU
+
+    )[1]
+
+    inverted_otsu = cv2.bitwise_not(
+        otsu
+    )
+
+    adaptive = cv2.adaptiveThreshold(
+
+        denoise,
+
+        255,
+
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+
+        cv2.THRESH_BINARY,
+
+        31,
+
+        9
+    )
+
+    return [
+
+        enlarged,
+        gray,
+        clahe,
+        sharpen,
+        denoise,
+        otsu,
+        inverted_otsu,
+        adaptive,
+    ]
+
+
+# ============================================================
+# STRICT DASH FALLBACK
+#
+# IMPORTANT:
+# Only used AFTER OCR has failed to find useful number/text.
+# ============================================================
+
+def strict_dash_fallback(crop):
+
+    if (
+        crop is None
+        or crop.size == 0
+    ):
+
+        return False
+
+    if crop.ndim == 3:
 
         gray = cv2.cvtColor(
-            enlarged,
+            crop,
             cv2.COLOR_RGB2GRAY
         )
 
     else:
 
-        gray = enlarged.copy()
+        gray = crop.copy()
 
-    variants.append(
-        (
-            "gray",
-            gray
-        )
+    gray = cv2.resize(
+
+        gray,
+
+        None,
+
+        fx=5.0,
+
+        fy=5.0,
+
+        interpolation=cv2.INTER_CUBIC
     )
 
-    # --------------------------------------------------------
-    # CLAHE
-    # --------------------------------------------------------
+    gray = cv2.copyMakeBorder(
 
-    clahe = cv2.createCLAHE(
-        clipLimit=2.0,
-        tileGridSize=(8, 8)
+        gray,
+
+        15,
+        15,
+        15,
+        15,
+
+        cv2.BORDER_CONSTANT,
+
+        value=255
     )
 
-    enhanced = clahe.apply(
-        gray
-    )
+    binary = cv2.threshold(
 
-    variants.append(
-        (
-            "clahe",
-            enhanced
-        )
-    )
+        gray,
 
-    # --------------------------------------------------------
-    # SHARPEN
-    # --------------------------------------------------------
-
-    sharpen_kernel = np.array([
-        [0, -1, 0],
-        [-1, 5, -1],
-        [0, -1, 0]
-    ])
-
-    sharpened = cv2.filter2D(
-        enhanced,
-        -1,
-        sharpen_kernel
-    )
-
-    variants.append(
-        (
-            "sharpen",
-            sharpened
-        )
-    )
-
-    # --------------------------------------------------------
-    # LIGHT DENOISE
-    # --------------------------------------------------------
-
-    denoised = cv2.GaussianBlur(
-        enhanced,
-        (3, 3),
-        0
-    )
-
-    variants.append(
-        (
-            "denoised",
-            denoised
-        )
-    )
-
-    # --------------------------------------------------------
-    # OTSU
-    # --------------------------------------------------------
-
-    _, otsu = cv2.threshold(
-        enhanced,
         0,
+
         255,
-        cv2.THRESH_BINARY
+
+        cv2.THRESH_BINARY_INV
         + cv2.THRESH_OTSU
+
+    )[1]
+
+    contours, _ = cv2.findContours(
+
+        binary,
+
+        cv2.RETR_EXTERNAL,
+
+        cv2.CHAIN_APPROX_SIMPLE
     )
 
-    variants.append(
-        (
-            "otsu",
-            otsu
-        )
+    image_h, image_w = (
+        binary.shape[:2]
     )
 
-    # --------------------------------------------------------
-    # INVERTED OTSU
-    # --------------------------------------------------------
+    for contour in contours:
 
-    otsu_inverse = cv2.bitwise_not(
-        otsu
-    )
-
-    variants.append(
-        (
-            "otsu_inv",
-            otsu_inverse
-        )
-    )
-
-    # --------------------------------------------------------
-    # ADAPTIVE
-    # --------------------------------------------------------
-
-    adaptive = cv2.adaptiveThreshold(
-        enhanced,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        9
-    )
-
-    variants.append(
-        (
-            "adaptive",
-            adaptive
-        )
-    )
-
-    return variants
-
-
-# ============================================================
-# RUN EASYOCR ON ONE VARIANT
-# ============================================================
-
-def run_easyocr_variant(
-    variant,
-    class_name
-):
-
-    allowlist = OCR_ALLOWLISTS.get(
-        class_name
-    )
-
-    kwargs = {
-        "detail": 1,
-        "paragraph": False,
-        "decoder": "greedy",
-
-        "text_threshold": 0.35,
-        "low_text": 0.20,
-        "link_threshold": 0.20,
-
-        "add_margin": 0.05,
-
-        "rotation_info": None,
-    }
-
-    if allowlist:
-        kwargs["allowlist"] = allowlist
-
-    try:
-
-        results = ocr_reader.readtext(
-            variant,
-            **kwargs
+        x, y, width, height = (
+            cv2.boundingRect(
+                contour
+            )
         )
 
-    except Exception:
-        return []
+        area = (
+            width
+            * height
+        )
 
-    candidates = []
+        if area < 20:
 
-    for result in results:
-
-        if len(result) < 3:
             continue
 
-        text = clean_ocr_text(
-            result[1]
+        ratio = (
+            width
+            / max(
+                height,
+                1
+            )
         )
 
-        confidence = float(
-            result[2]
+        # Must be strongly horizontal
+        if ratio < 3.2:
+
+            continue
+
+        # Must NOT look like a long table border
+        if width > (
+            image_w
+            * 0.65
+        ):
+
+            continue
+
+        # Must be short vertically
+        if height > (
+            image_h
+            * 0.22
+        ):
+
+            continue
+
+        cx = (
+            x
+            + width / 2
+        )
+
+        cy = (
+            y
+            + height / 2
+        )
+
+        centre_x_ok = (
+            abs(
+                cx
+                - image_w / 2
+            )
+            < image_w * 0.32
+        )
+
+        centre_y_ok = (
+            abs(
+                cy
+                - image_h / 2
+            )
+            < image_h * 0.32
         )
 
         if (
-            text
-            and confidence
-            >= OCR_MIN_CONFIDENCE
+            centre_x_ok
+            and centre_y_ok
         ):
 
-            candidates.append(
-                {
-                    "text": text,
-                    "confidence": confidence
-                }
+            return True
+
+    return False
+
+
+# ============================================================
+# NORMALISE ELEMENT
+# ============================================================
+
+def normalise_element(text):
+
+    mapped = apply_mapping(
+        text,
+        ELEMENT_MAPPING
+    )
+
+    if mapped is not None:
+
+        return mapped, True
+
+    token = re.sub(
+        r"[^A-Za-z]",
+        "",
+        clean_text(text)
+    )
+
+    if not token:
+
+        return clean_text(text), False
+
+    if len(token) == 1:
+
+        candidate = (
+            token.upper()
+        )
+
+    elif len(token) == 2:
+
+        candidate = (
+            token[0].upper()
+            + token[1].lower()
+        )
+
+    else:
+
+        return clean_text(text), False
+
+    if candidate in VALID_ELEMENTS:
+
+        return candidate, True
+
+    return clean_text(text), False
+
+
+# ============================================================
+# NORMALISE UNIT
+# ============================================================
+
+def normalise_unit(text):
+
+    mapped = apply_mapping(
+        text,
+        UNIT_MAPPING
+    )
+
+    if mapped is not None:
+
+        return mapped, True
+
+    token = (
+        clean_text(text)
+        .lower()
+        .replace(
+            " ",
+            ""
+        )
+    )
+
+    if "%" in token:
+
+        return "%", True
+
+    if "ppm" in token:
+
+        return "ppm", True
+
+    if "ppb" in token:
+
+        return "ppb", True
+
+    return clean_text(text), False
+
+
+# ============================================================
+# NORMALISE LIMIT
+# ============================================================
+
+def normalise_limit(text):
+
+    mapped = apply_mapping(
+        text,
+        LIMIT_MAPPING
+    )
+
+    if mapped is not None:
+
+        return mapped, True
+
+    token = (
+        clean_text(text)
+        .lower()
+    )
+
+    if token.startswith(
+        "max"
+    ):
+
+        return "MAX", True
+
+    if token.startswith(
+        "min"
+    ):
+
+        return "MIN", True
+
+    return clean_text(text), False
+
+
+# ============================================================
+# NORMALISE SIGN
+# ============================================================
+
+def normalise_sign(text):
+
+    mapped = apply_mapping(
+        text,
+        SIGN_MAPPING
+    )
+
+    if mapped is not None:
+
+        return mapped, True
+
+    value = (
+        clean_text(text)
+        .replace(
+            "≤",
+            "<="
+        )
+        .replace(
+            "≥",
+            ">="
+        )
+    )
+
+    if value in {
+        "<",
+        ">",
+        "<=",
+        ">="
+    }:
+
+        return value, True
+
+    return value, False
+
+
+# ============================================================
+# NORMALISE ELEMENT VALUE
+# ============================================================
+
+def normalise_value(text):
+
+    original = clean_text(
+        text
+    )
+
+    mapped = apply_mapping(
+        original,
+        VALUE_MAPPING
+    )
+
+    if mapped is not None:
+
+        return mapped, True
+
+    value = original.translate(
+
+        str.maketrans({
+
+            "O": "0",
+            "o": "0",
+
+            "I": "1",
+            "l": "1",
+            "|": "1",
+
+            ",": ".",
+        })
+    )
+
+    value = (
+        value
+        .replace(
+            "−",
+            "-"
+        )
+        .replace(
+            "–",
+            "-"
+        )
+        .replace(
+            "—",
+            "-"
+        )
+    )
+
+    value = re.sub(
+        r"\s+",
+        "",
+        value
+    )
+
+    if value == "-":
+
+        return "-", True
+
+    if re.fullmatch(
+        r"[+-]?\d+(?:\.\d+)?",
+        value
+    ):
+
+        return value, True
+
+    if re.fullmatch(
+        r"[<>]=?[+-]?\d+(?:\.\d+)?",
+        value
+    ):
+
+        return value, True
+
+    if re.fullmatch(
+        r"[A-Za-z]+",
+        original
+    ):
+
+        return original, True
+
+    return value, False
+
+
+# ============================================================
+# NORMALISE RANGE
+# ============================================================
+
+def normalise_range(text):
+
+    value = clean_text(
+        text
+    )
+
+    for old, new in (
+        ("–", "-"),
+        ("—", "-"),
+        ("−", "-"),
+    ):
+
+        value = value.replace(
+            old,
+            new
+        )
+
+    value = (
+        value
+        .replace(
+            ",",
+            "."
+        )
+        .replace(
+            " ",
+            ""
+        )
+    )
+
+    if re.fullmatch(
+
+        r"[+-]?\d+(?:\.\d+)?"
+        r"-"
+        r"[+-]?\d+(?:\.\d+)?",
+
+        value
+    ):
+
+        return value, True
+
+    return value, False
+
+
+# ============================================================
+# OCR ALLOWLIST
+# ============================================================
+
+def get_allowlist(class_name):
+
+    if class_name == "element_symbol":
+
+        return (
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz"
+        )
+
+    if class_name == "unit":
+
+        return (
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz"
+            "%."
+        )
+
+    if class_name == "limit_indicator":
+
+        return (
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz"
+        )
+
+    if class_name == "value_range":
+
+        return (
+            "0123456789"
+            ".,+-"
+        )
+
+    if class_name == "sign":
+
+        return (
+            "<>=-"
+        )
+
+    return None
+
+
+# ============================================================
+# EASY OCR CANDIDATES
+# ============================================================
+
+def run_easyocr_candidates(
+    reader,
+    variants,
+    allowlist,
+    text_threshold=0.40,
+    low_text=0.20,
+    link_threshold=0.25,
+):
+
+    candidates = []
+
+    for variant_index, variant in enumerate(
+        variants
+    ):
+
+        try:
+
+            results = reader.readtext(
+
+                variant,
+
+                detail=1,
+
+                paragraph=False,
+
+                allowlist=allowlist,
+
+                decoder="beamsearch",
+
+                beamWidth=5,
+
+                contrast_ths=0.05,
+
+                adjust_contrast=0.7,
+
+                text_threshold=text_threshold,
+
+                low_text=low_text,
+
+                link_threshold=link_threshold,
             )
+
+            if not results:
+
+                continue
+
+            raw = clean_text(
+
+                " ".join(
+                    item[1]
+                    for item
+                    in results
+                )
+            )
+
+            confidence = float(
+
+                np.mean(
+                    [
+                        item[2]
+                        for item
+                        in results
+                    ]
+                )
+            )
+
+            if raw:
+
+                candidates.append({
+
+                    "raw":
+                        raw,
+
+                    "confidence":
+                        confidence,
+
+                    "variant":
+                        variant_index,
+                })
+
+        except Exception:
+
+            continue
 
     return candidates
 
 
 # ============================================================
-# OCR CANDIDATE SCORING
+# ELEMENT VALUE OCR
+#
+# Handles:
+#
+#   0.10
+#   5.4
+#   3.20
+#   -
+#   Bal
+#   Balance
+#   Trace
+#
+# Priority:
+#
+#   known text
+#   numeric
+#   OCR dash
+#   strict dash fallback
+#   unknown text
 # ============================================================
 
-def score_candidate(
-    text,
-    confidence,
-    class_name
+def read_element_value(
+    reader,
+    crop
 ):
 
-    score = float(confidence)
-
-    clean_text = normalize_by_class(
-        text,
-        class_name
+    variants = preprocess_variants(
+        crop
     )
 
-    if not clean_text:
-        return -999
+    if not variants:
 
-
-    # --------------------------------------------------------
-    # ELEMENT SYMBOL
-    # --------------------------------------------------------
-
-    if class_name == "element_symbol":
-
-        if clean_text in CHEMICAL_ELEMENTS:
-            score += 0.70
-
-        elif len(clean_text) <= 2:
-            score += 0.10
-
-        else:
-            score -= 0.40
-
-
-    # --------------------------------------------------------
-    # ELEMENT VALUE
-    # --------------------------------------------------------
-
-    elif class_name == "element_value":
-
-        if re.search(
-            r"\d",
-            clean_text
-        ):
-            score += 0.45
-        else:
-            score -= 0.60
-
-        if "." in clean_text:
-            score += 0.08
-
-
-    # --------------------------------------------------------
-    # VALUE RANGE
-    # --------------------------------------------------------
-
-    elif class_name == "value_range":
-
-        numbers = re.findall(
-            r"\d+(?:\.\d+)?",
-            clean_text
+        return (
+            "",
+            0.0,
+            False,
+            ""
         )
 
-        if len(numbers) >= 2:
-            score += 0.60
 
-        elif len(numbers) == 1:
-            score += 0.10
+    # ========================================================
+    # PASS A - NUMERIC OCR
+    # ========================================================
 
-        else:
-            score -= 0.60
+    numeric_results = (
+        run_easyocr_candidates(
 
-        if "-" in clean_text:
-            score += 0.20
+            reader,
+
+            variants,
+
+            "0123456789.,+-<>",
+
+            text_threshold=0.30,
+
+            low_text=0.10,
+
+            link_threshold=0.16,
+        )
+    )
+
+    numeric_candidates = []
 
 
-    # --------------------------------------------------------
-    # UNIT
-    # --------------------------------------------------------
+    for candidate in numeric_results:
 
-    elif class_name == "unit":
+        raw = candidate[
+            "raw"
+        ]
 
-        lower = (
-            clean_text
-            .lower()
-            .replace(" ", "")
+        final, valid = (
+            normalise_value(
+                raw
+            )
         )
 
-        if lower in {
-            "%",
-            "ppm",
-            "ppb",
-            "wt%",
-            "wt.%",
-        }:
-            score += 0.65
-
-        elif (
-            "%" in lower
-            or "ppm" in lower
+        if (
+            valid
+            and final != "-"
+            and (
+                re.fullmatch(
+                    r"[+-]?\d+(?:\.\d+)?",
+                    final
+                )
+                or
+                re.fullmatch(
+                    r"[<>]=?[+-]?\d+(?:\.\d+)?",
+                    final
+                )
+            )
         ):
-            score += 0.35
 
-        else:
-            score -= 0.15
+            numeric_candidates.append({
 
+                "raw":
+                    raw,
 
-    # --------------------------------------------------------
-    # LIMIT INDICATOR
-    # --------------------------------------------------------
+                "final":
+                    final,
 
-    elif class_name == "limit_indicator":
-
-        upper = clean_text.upper()
-
-        if upper in {
-            "MAX",
-            "MIN"
-        }:
-            score += 0.80
-
-        elif upper in {
-            "MAXIMUM",
-            "MINIMUM"
-        }:
-            score += 0.65
-
-        else:
-            score -= 0.20
+                "confidence":
+                    candidate[
+                        "confidence"
+                    ],
+            })
 
 
-    # --------------------------------------------------------
-    # SIGN
-    # --------------------------------------------------------
+    # ========================================================
+    # PASS B - LETTERS ONLY
+    #
+    # Important:
+    # B cannot become 8 in this pass.
+    # ========================================================
 
-    elif class_name == "sign":
+    text_results = (
+        run_easyocr_candidates(
 
-        if clean_text in {
-            "<",
-            ">",
-            "<=",
-            ">=",
-            "=",
-        }:
-            score += 0.90
+            reader,
 
-        else:
-            score -= 0.60
+            variants,
 
-    return score
+            (
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                "abcdefghijklmnopqrstuvwxyz"
+            ),
+
+            text_threshold=0.28,
+
+            low_text=0.10,
+
+            link_threshold=0.16,
+        )
+    )
 
 
-# ============================================================
-# OCR ONE YOLO BOX
-# ============================================================
+    # ========================================================
+    # PRIORITY 1 - KNOWN TEXT
+    # ========================================================
 
-def read_crop_text(
-    image,
-    box
-):
+    mapped_text_candidates = []
 
-    class_name = box.get(
-        "class_name",
+
+    for candidate in text_results:
+
+        raw = clean_text(
+            candidate[
+                "raw"
+            ]
+        )
+
+        mapped = apply_mapping(
+            raw,
+            VALUE_MAPPING
+        )
+
+        if (
+            mapped is not None
+            and mapped != "-"
+        ):
+
+            mapped_text_candidates.append({
+
+                "raw":
+                    raw,
+
+                "final":
+                    mapped,
+
+                "confidence":
+                    candidate[
+                        "confidence"
+                    ],
+            })
+
+
+    if mapped_text_candidates:
+
+        best = max(
+
+            mapped_text_candidates,
+
+            key=lambda item:
+                item[
+                    "confidence"
+                ]
+        )
+
+        return (
+
+            best[
+                "final"
+            ],
+
+            best[
+                "confidence"
+            ],
+
+            True,
+
+            best[
+                "raw"
+            ]
+        )
+
+
+    # ========================================================
+    # PRIORITY 2 - NUMERIC RESULT
+    # ========================================================
+
+    if numeric_candidates:
+
+        best = max(
+
+            numeric_candidates,
+
+            key=lambda item: (
+
+                item[
+                    "confidence"
+                ],
+
+                len(
+                    item[
+                        "final"
+                    ]
+                )
+            )
+        )
+
+        return (
+
+            best[
+                "final"
+            ],
+
+            best[
+                "confidence"
+            ],
+
+            True,
+
+            best[
+                "raw"
+            ]
+        )
+
+
+    # ========================================================
+    # PRIORITY 3 - REAL OCR DASH
+    # ========================================================
+
+    dash_candidates = []
+
+    for candidate in numeric_results:
+
+        raw = (
+            clean_text(
+                candidate[
+                    "raw"
+                ]
+            )
+            .replace(
+                "–",
+                "-"
+            )
+            .replace(
+                "—",
+                "-"
+            )
+            .replace(
+                "−",
+                "-"
+            )
+        )
+
+        if raw == "-":
+
+            dash_candidates.append(
+                candidate
+            )
+
+
+    if dash_candidates:
+
+        best = max(
+
+            dash_candidates,
+
+            key=lambda item:
+                item[
+                    "confidence"
+                ]
+        )
+
+        return (
+
+            "-",
+
+            best[
+                "confidence"
+            ],
+
+            True,
+
+            best[
+                "raw"
+            ]
+        )
+
+
+    # ========================================================
+    # PRIORITY 4 - STRICT DASH IMAGE FALLBACK
+    # ========================================================
+
+    if strict_dash_fallback(
+        crop
+    ):
+
+        return (
+            "-",
+            0.70,
+            True,
+            "-"
+        )
+
+
+    # ========================================================
+    # PRIORITY 5 - UNKNOWN TEXT
+    # ========================================================
+
+    if text_results:
+
+        best = max(
+
+            text_results,
+
+            key=lambda item:
+                item[
+                    "confidence"
+                ]
+        )
+
+        raw = clean_text(
+            best[
+                "raw"
+            ]
+        )
+
+        final, mapped = (
+            normalise_value(
+                raw
+            )
+        )
+
+        return (
+
+            final,
+
+            best[
+                "confidence"
+            ],
+
+            mapped,
+
+            raw
+        )
+
+
+    return (
+        "",
+        0.0,
+        False,
         ""
     )
 
-    crop = get_padded_crop(
+
+# ============================================================
+# RANGE OCR
+# ============================================================
+
+def read_value_range(
+    reader,
+    crop
+):
+
+    variants = preprocess_variants(
+        crop
+    )
+
+    candidates = (
+        run_easyocr_candidates(
+
+            reader,
+
+            variants,
+
+            "0123456789.,+-",
+
+            text_threshold=0.30,
+
+            low_text=0.10,
+
+            link_threshold=0.16,
+        )
+    )
+
+    if not candidates:
+
+        return (
+            "",
+            0.0,
+            False,
+            ""
+        )
+
+    processed = []
+
+    for candidate in candidates:
+
+        final, valid = (
+            normalise_range(
+                candidate[
+                    "raw"
+                ]
+            )
+        )
+
+        processed.append({
+
+            "raw":
+                candidate[
+                    "raw"
+                ],
+
+            "final":
+                final,
+
+            "valid":
+                valid,
+
+            "confidence":
+                candidate[
+                    "confidence"
+                ],
+        })
+
+    processed.sort(
+
+        key=lambda item: (
+
+            item[
+                "valid"
+            ],
+
+            item[
+                "confidence"
+            ],
+
+            len(
+                item[
+                    "final"
+                ]
+            )
+        ),
+
+        reverse=True
+    )
+
+    best = processed[
+        0
+    ]
+
+    return (
+
+        best[
+            "final"
+        ],
+
+        best[
+            "confidence"
+        ],
+
+        best[
+            "valid"
+        ],
+
+        best[
+            "raw"
+        ]
+    )
+
+
+# ============================================================
+# OCR ONE CROP
+# ============================================================
+
+def read_crop_text(
+    reader,
+    image,
+    detection
+):
+
+    class_name = detection[
+        "class_name"
+    ]
+
+    crop = padded_crop(
         image,
-        box
+        detection
     )
 
     if (
@@ -1269,287 +1881,671 @@ def read_crop_text(
         or crop.size == 0
     ):
 
-        return {
-            "text": "",
-            "ocr_confidence": 0.0,
-            "ocr_variant": "",
-            "raw_text": "",
-        }
-
-    variants = create_ocr_variants(
-        crop
-    )
-
-    all_candidates = []
-
-    for (
-        variant_name,
-        variant
-    ) in variants:
-
-        candidates = run_easyocr_variant(
-            variant,
-            class_name
+        return (
+            "",
+            0.0,
+            False,
+            ""
         )
 
-        for candidate in candidates:
 
-            raw_text = candidate["text"]
+    # --------------------------------------------------------
+    # element_value
+    # --------------------------------------------------------
 
-            confidence = candidate[
-                "confidence"
-            ]
+    if class_name == "element_value":
 
-            normalized = normalize_by_class(
-                raw_text,
-                class_name
-            )
+        return read_element_value(
+            reader,
+            crop
+        )
 
-            score = score_candidate(
-                raw_text,
-                confidence,
-                class_name
-            )
 
-            all_candidates.append(
-                {
-                    "raw_text": raw_text,
-                    "text": normalized,
-                    "confidence": confidence,
-                    "variant": variant_name,
-                    "score": score,
-                }
-            )
+    # --------------------------------------------------------
+    # value_range
+    # --------------------------------------------------------
 
-    if not all_candidates:
+    if class_name == "value_range":
 
-        return {
-            "text": "",
-            "ocr_confidence": 0.0,
-            "ocr_variant": "",
-            "raw_text": "",
-        }
+        return read_value_range(
+            reader,
+            crop
+        )
 
-    best = max(
-        all_candidates,
-        key=lambda x: x["score"]
+
+    allowlist = get_allowlist(
+        class_name
     )
 
-    return {
-        "text": best["text"],
-        "ocr_confidence": best["confidence"],
-        "ocr_variant": best["variant"],
-        "raw_text": best["raw_text"],
-    }
+    candidates = (
+        run_easyocr_candidates(
+
+            reader,
+
+            preprocess_variants(
+                crop
+            ),
+
+            allowlist,
+
+            text_threshold=0.38,
+
+            low_text=0.18,
+
+            link_threshold=0.22,
+        )
+    )
+
+    if not candidates:
+
+        return (
+            "",
+            0.0,
+            False,
+            ""
+        )
+
+    raw_text, confidence = max(
+
+        (
+            (
+                item[
+                    "raw"
+                ],
+
+                item[
+                    "confidence"
+                ]
+            )
+
+            for item
+            in candidates
+        ),
+
+        key=lambda item: (
+
+            item[1],
+
+            len(
+                item[0]
+            )
+        )
+    )
+
+
+    if class_name == "element_symbol":
+
+        final_text, mapped = (
+            normalise_element(
+                raw_text
+            )
+        )
+
+    elif class_name == "unit":
+
+        final_text, mapped = (
+            normalise_unit(
+                raw_text
+            )
+        )
+
+    elif class_name == "limit_indicator":
+
+        final_text, mapped = (
+            normalise_limit(
+                raw_text
+            )
+        )
+
+    elif class_name == "sign":
+
+        final_text, mapped = (
+            normalise_sign(
+                raw_text
+            )
+        )
+
+    else:
+
+        final_text = raw_text
+
+        mapped = False
+
+
+    return (
+
+        final_text,
+
+        confidence,
+
+        mapped,
+
+        raw_text
+    )
 
 
 # ============================================================
-# YOLO DETECTION
+# SORT READING ORDER
 # ============================================================
 
-def run_yolo(image):
+def sort_reading_order(
+    detections
+):
 
-    results = model.predict(
-        source=image,
+    if not detections:
 
-        imgsz=IMAGE_SIZE,
-
-        conf=CONFIDENCE,
-
-        iou=IOU_THRESHOLD,
-
-        max_det=MAX_DETECTIONS,
-
-        agnostic_nms=False,
-
-        device=DEVICE,
-
-        verbose=False
-    )
-
-    result = results[0]
-
-    detections = []
-
-    if result.boxes is None:
         return detections
 
-    for box in result.boxes:
+    median_height = max(
 
-        class_id = int(
-            box.cls[0]
-            .cpu()
-            .item()
+        1,
+
+        int(
+            np.median(
+                [
+                    d["y2"]
+                    - d["y1"]
+                    for d
+                    in detections
+                ]
+            )
         )
+    )
 
-        class_name = model.names[
-            class_id
-        ]
+    return sorted(
 
-        confidence = float(
-            box.conf[0]
-            .cpu()
-            .item()
+        detections,
+
+        key=lambda d: (
+
+            round(
+                d["cy"]
+                / median_height
+            ),
+
+            d["x1"]
         )
-
-        x1, y1, x2, y2 = (
-            box.xyxy[0]
-            .cpu()
-            .numpy()
-            .astype(int)
-        )
-
-        detections.append(
-            {
-                "class_id": class_id,
-                "class_name": class_name,
-
-                "yolo_confidence":
-                    confidence,
-
-                "x1": int(x1),
-                "y1": int(y1),
-                "x2": int(x2),
-                "y2": int(y2),
-            }
-        )
-
-    return detections
+    )
 
 
 # ============================================================
-# CLASS COLORS
-# RGB because image is RGB
+# OVERLAY LABEL
 # ============================================================
 
-CLASS_COLORS = {
+def make_overlay_label(
+    detection
+):
 
-    "element_symbol":
-        (255, 0, 0),
+    class_name = detection[
+        "class_name"
+    ]
 
-    "element_value":
-        (0, 180, 255),
+    text = (
+        detection.get(
+            "text",
+            ""
+        )
+        or "?"
+    )
 
-    "unit":
-        (0, 180, 0),
+    if len(text) > OVERLAY_MAX_TEXT_LENGTH:
 
-    "limit_indicator":
-        (180, 0, 255),
+        text = (
+            text[
+                :OVERLAY_MAX_TEXT_LENGTH - 3
+            ]
+            + "..."
+        )
 
-    "value_range":
-        (255, 0, 180),
+    if SHOW_CLASS_PREFIX:
 
-    "sign":
-        (255, 140, 0),
-}
+        short = CLASS_SHORT.get(
+            class_name,
+            "?"
+        )
+
+        return (
+            f"{short}: {text}"
+        )
+
+    return text
 
 
 # ============================================================
-# SHORT LABELS
+# DRAW TRANSPARENT LABEL
 # ============================================================
 
-SHORT_NAMES = {
+def draw_transparent_label(
+    image,
+    label,
+    x,
+    y,
+    colour,
+):
 
-    "element_symbol":
-        "EL",
+    font = (
+        cv2.FONT_HERSHEY_SIMPLEX
+    )
 
-    "element_value":
-        "VAL",
+    font_scale = (
+        OVERLAY_FONT_SCALE
+    )
 
-    "unit":
-        "UNIT",
+    thickness = (
+        OVERLAY_FONT_THICKNESS
+    )
 
-    "limit_indicator":
-        "LIM",
+    (
+        text_width,
+        text_height
+    ), baseline = cv2.getTextSize(
 
-    "value_range":
-        "RANGE",
+        label,
 
-    "sign":
-        "SIGN",
-}
+        font,
+
+        font_scale,
+
+        thickness
+    )
+
+    pad = (
+        OVERLAY_TEXT_PADDING
+    )
+
+    x1 = max(
+        0,
+        x
+    )
+
+    y1 = max(
+        0,
+        y
+    )
+
+    x2 = min(
+
+        image.shape[1] - 1,
+
+        x1
+        + text_width
+        + pad * 2
+    )
+
+    y2 = min(
+
+        image.shape[0] - 1,
+
+        y1
+        + text_height
+        + baseline
+        + pad * 2
+    )
+
+    overlay = (
+        image.copy()
+    )
+
+    cv2.rectangle(
+
+        overlay,
+
+        (
+            x1,
+            y1
+        ),
+
+        (
+            x2,
+            y2
+        ),
+
+        colour,
+
+        -1
+    )
+
+    cv2.addWeighted(
+
+        overlay,
+
+        OVERLAY_LABEL_ALPHA,
+
+        image,
+
+        1.0
+        - OVERLAY_LABEL_ALPHA,
+
+        0,
+
+        image
+    )
+
+    cv2.putText(
+
+        image,
+
+        label,
+
+        (
+            x1 + pad,
+            y1
+            + text_height
+            + pad
+        ),
+
+        font,
+
+        font_scale,
+
+        (
+            255,
+            255,
+            255
+        ),
+
+        thickness,
+
+        cv2.LINE_AA
+    )
+
+    return (
+        x1,
+        y1,
+        x2,
+        y2
+    )
+
+
+# ============================================================
+# OVERLAP TEST
+# ============================================================
+
+def rectangles_overlap(
+    a,
+    b
+):
+
+    ax1, ay1, ax2, ay2 = a
+
+    bx1, by1, bx2, by2 = b
+
+    return not (
+
+        ax2 < bx1
+        or bx2 < ax1
+        or ay2 < by1
+        or by2 < ay1
+    )
 
 
 # ============================================================
 # DRAW OCR OVERLAY
 # ============================================================
 
-def draw_ocr_overlay(
+def draw_overlay(
     image,
     detections
 ):
 
     output = image.copy()
 
-    for d in detections:
+    occupied_labels = []
 
-        x1 = d["x1"]
-        y1 = d["y1"]
-        x2 = d["x2"]
-        y2 = d["y2"]
+    for detection in detections:
 
-        text = d.get(
-            "text",
-            ""
-        )
+        x1 = detection[
+            "x1"
+        ]
 
-        class_name = d.get(
-            "class_name",
-            ""
-        )
+        y1 = detection[
+            "y1"
+        ]
 
-        color = CLASS_COLORS.get(
+        x2 = detection[
+            "x2"
+        ]
+
+        y2 = detection[
+            "y2"
+        ]
+
+        class_name = detection[
+            "class_name"
+        ]
+
+        colour = CLASS_COLOURS.get(
+
             class_name,
-            (255, 255, 255)
+
+            (120, 120, 120)
         )
 
-        # Thin detection box
         cv2.rectangle(
+
             output,
-            (x1, y1),
-            (x2, y2),
-            color,
-            1
-        )
-
-        short_name = SHORT_NAMES.get(
-            class_name,
-            class_name
-        )
-
-        if text:
-
-            display_text = (
-                f"{short_name}:{text}"
-            )
-
-        else:
-
-            display_text = (
-                f"{short_name}:?"
-            )
-
-        cv2.putText(
-            output,
-            display_text,
 
             (
                 x1,
-                max(
-                    y1 - 2,
-                    8
-                )
+                y1
             ),
 
-            cv2.FONT_HERSHEY_SIMPLEX,
+            (
+                x2,
+                y2
+            ),
 
-            0.28,
+            colour,
 
-            color,
+            OVERLAY_BOX_THICKNESS
+        )
 
-            1,
+        if not SHOW_OVERLAY_TEXT:
 
-            cv2.LINE_AA
+            continue
+
+        label = make_overlay_label(
+            detection
+        )
+
+        font = (
+            cv2.FONT_HERSHEY_SIMPLEX
+        )
+
+        (
+            text_width,
+            text_height
+        ), baseline = cv2.getTextSize(
+
+            label,
+
+            font,
+
+            OVERLAY_FONT_SCALE,
+
+            OVERLAY_FONT_THICKNESS
+        )
+
+        label_width = (
+            text_width
+            + OVERLAY_TEXT_PADDING * 2
+        )
+
+        label_height = (
+            text_height
+            + baseline
+            + OVERLAY_TEXT_PADDING * 2
+        )
+
+        candidates = [
+
+            (
+                x2 + 4,
+                y1
+            ),
+
+            (
+                max(
+                    0,
+                    x1
+                    - label_width
+                    - 4
+                ),
+                y1
+            ),
+
+            (
+                x1,
+                y1
+                - label_height
+                - 2
+            ),
+
+            (
+                x1,
+                y2 + 2
+            ),
+        ]
+
+        chosen = None
+
+        for candidate_x, candidate_y in candidates:
+
+            candidate_x = max(
+                0,
+                candidate_x
+            )
+
+            candidate_y = max(
+                0,
+                candidate_y
+            )
+
+            if (
+                candidate_x
+                + label_width
+                >= output.shape[1]
+            ):
+
+                candidate_x = max(
+
+                    0,
+
+                    output.shape[1]
+                    - label_width
+                    - 1
+                )
+
+            if (
+                candidate_y
+                + label_height
+                >= output.shape[0]
+            ):
+
+                candidate_y = max(
+
+                    0,
+
+                    output.shape[0]
+                    - label_height
+                    - 1
+                )
+
+            rect = (
+
+                candidate_x,
+                candidate_y,
+
+                candidate_x
+                + label_width,
+
+                candidate_y
+                + label_height
+            )
+
+            has_overlap = any(
+
+                rectangles_overlap(
+                    rect,
+                    existing
+                )
+
+                for existing
+                in occupied_labels
+            )
+
+            if not has_overlap:
+
+                chosen = (
+                    candidate_x,
+                    candidate_y,
+                    rect
+                )
+
+                break
+
+        if chosen is None:
+
+            candidate_x = max(
+                0,
+                x2 + 3
+            )
+
+            candidate_y = max(
+                0,
+                y1
+            )
+
+            if (
+                candidate_x
+                + label_width
+                >= output.shape[1]
+            ):
+
+                candidate_x = max(
+                    0,
+                    x1
+                    - label_width
+                    - 3
+                )
+
+            rect = (
+
+                candidate_x,
+                candidate_y,
+
+                candidate_x
+                + label_width,
+
+                candidate_y
+                + label_height
+            )
+
+            chosen = (
+                candidate_x,
+                candidate_y,
+                rect
+            )
+
+        label_x, label_y, rect = (
+            chosen
+        )
+
+        draw_transparent_label(
+
+            output,
+
+            label,
+
+            label_x,
+
+            label_y,
+
+            colour
+        )
+
+        occupied_labels.append(
+            rect
         )
 
     return output
@@ -1563,18 +2559,16 @@ class OCRInspectionTool:
 
     def __init__(
         self,
-        root
+        root,
+        model,
+        reader
     ):
 
         self.root = root
 
-        self.root.title(
-            "Chemical Table Detection + OCR Inspection"
-        )
+        self.model = model
 
-        self.root.geometry(
-            "1650x950"
-        )
+        self.reader = reader
 
         self.file_path = None
 
@@ -1582,140 +2576,272 @@ class OCRInspectionTool:
 
         self.annotated_image = None
 
-        self.tk_image = None
+        self.detections = []
 
         self.current_page = 0
 
         self.pdf_pages = 0
 
-        self.detections = []
+        self.tk_image = None
 
+        self.zoom = 1.0
 
-        # ====================================================
-        # MAIN FRAME
-        # ====================================================
+        self.min_zoom = 0.05
 
-        main_frame = ttk.Frame(
-            root,
-            padding=8
+        self.max_zoom = 8.0
+
+        self.busy = False
+
+        self.image_item = None
+
+        root.title(
+            "Chemical Document Quick Viewer + YOLO OCR"
         )
 
-        main_frame.pack(
-            fill=tk.BOTH,
-            expand=True
-        )
+        try:
 
-
-        # ====================================================
-        # TOP CONTROLS
-        # ====================================================
-
-        control_panel = ttk.Frame(
-            main_frame
-        )
-
-        control_panel.pack(
-            fill=tk.X,
-            pady=(0, 8)
-        )
-
-
-        ttk.Button(
-            control_panel,
-
-            text="Upload PDF / Image",
-
-            command=
-                self.upload_file
-
-        ).pack(
-            side=tk.LEFT,
-            padx=(0, 5)
-        )
-
-
-        ttk.Button(
-            control_panel,
-
-            text="Run Detection + OCR",
-
-            command=
-                self.run_inspection
-
-        ).pack(
-            side=tk.LEFT,
-            padx=5
-        )
-
-
-        ttk.Button(
-            control_panel,
-
-            text="Previous PDF Page",
-
-            command=
-                self.previous_page
-
-        ).pack(
-            side=tk.LEFT,
-            padx=5
-        )
-
-
-        ttk.Button(
-            control_panel,
-
-            text="Next PDF Page",
-
-            command=
-                self.next_page
-
-        ).pack(
-            side=tk.LEFT,
-            padx=5
-        )
-
-
-        self.file_label = ttk.Label(
-            control_panel,
-
-            text="No document loaded",
-
-            font=(
-                "Segoe UI",
-                10
+            root.state(
+                "zoomed"
             )
+
+        except Exception:
+
+            screen_w = (
+                root.winfo_screenwidth()
+            )
+
+            screen_h = (
+                root.winfo_screenheight()
+            )
+
+            root.geometry(
+                f"{int(screen_w * 0.95)}x"
+                f"{int(screen_h * 0.90)}"
+            )
+
+        root.minsize(
+            950,
+            600
         )
 
-        self.file_label.pack(
+        self._build_gui()
+
+
+    # ========================================================
+    # BUILD GUI
+    # ========================================================
+
+    def _build_gui(self):
+
+        toolbar = ttk.Frame(
+            self.root,
+            padding=5
+        )
+
+        toolbar.pack(
+            fill=tk.X
+        )
+
+        self.open_button = ttk.Button(
+
+            toolbar,
+
+            text="Open PDF / image",
+
+            command=self.upload_file
+        )
+
+        self.open_button.pack(
             side=tk.LEFT,
-            padx=15
+            padx=2
         )
 
+        self.run_button = ttk.Button(
+
+            toolbar,
+
+            text="Run YOLO + OCR",
+
+            command=self.start_inspection
+        )
+
+        self.run_button.pack(
+            side=tk.LEFT,
+            padx=2
+        )
+
+        ttk.Separator(
+            toolbar,
+            orient=tk.VERTICAL
+        ).pack(
+            side=tk.LEFT,
+            fill=tk.Y,
+            padx=8
+        )
+
+        self.previous_button = ttk.Button(
+
+            toolbar,
+
+            text="◀ Previous",
+
+            command=lambda:
+                self.change_page(-1)
+        )
+
+        self.previous_button.pack(
+            side=tk.LEFT,
+            padx=2
+        )
+
+        self.next_button = ttk.Button(
+
+            toolbar,
+
+            text="Next ▶",
+
+            command=lambda:
+                self.change_page(1)
+        )
+
+        self.next_button.pack(
+            side=tk.LEFT,
+            padx=2
+        )
 
         self.page_label = ttk.Label(
-            control_panel,
-            text=""
+
+            toolbar,
+
+            text="Page 0 / 0"
         )
 
         self.page_label.pack(
             side=tk.LEFT,
-            padx=5
+            padx=8
         )
 
+        ttk.Separator(
+            toolbar,
+            orient=tk.VERTICAL
+        ).pack(
+            side=tk.LEFT,
+            fill=tk.Y,
+            padx=8
+        )
+
+        ttk.Button(
+
+            toolbar,
+
+            text="Fit Page",
+
+            command=self.fit_page
+        ).pack(
+            side=tk.LEFT,
+            padx=2
+        )
+
+        ttk.Button(
+
+            toolbar,
+
+            text="Fit Width",
+
+            command=self.fit_width
+        ).pack(
+            side=tk.LEFT,
+            padx=2
+        )
+
+        ttk.Button(
+
+            toolbar,
+
+            text="100%",
+
+            command=self.reset_zoom
+        ).pack(
+            side=tk.LEFT,
+            padx=2
+        )
+
+        ttk.Button(
+
+            toolbar,
+
+            text="−",
+
+            width=3,
+
+            command=lambda:
+                self.zoom_button(
+                    1 / 1.20
+                )
+        ).pack(
+            side=tk.LEFT,
+            padx=1
+        )
+
+        ttk.Button(
+
+            toolbar,
+
+            text="+",
+
+            width=3,
+
+            command=lambda:
+                self.zoom_button(
+                    1.20
+                )
+        ).pack(
+            side=tk.LEFT,
+            padx=1
+        )
+
+        self.zoom_label = ttk.Label(
+
+            toolbar,
+
+            text="100%"
+        )
+
+        self.zoom_label.pack(
+            side=tk.LEFT,
+            padx=8
+        )
+
+        ttk.Separator(
+            toolbar,
+            orient=tk.VERTICAL
+        ).pack(
+            side=tk.LEFT,
+            fill=tk.Y,
+            padx=8
+        )
+
+        self.overlay_button = ttk.Button(
+
+            toolbar,
+
+            text="Hide OCR Overlay",
+
+            command=self.toggle_overlay
+        )
+
+        self.overlay_button.pack(
+            side=tk.LEFT,
+            padx=2
+        )
 
         self.status_label = ttk.Label(
-            control_panel,
+
+            toolbar,
 
             text="Ready",
 
-            font=(
-                "Segoe UI",
-                10,
-                "bold"
-            ),
-
-            foreground="blue"
+            foreground="#174ea6"
         )
 
         self.status_label.pack(
@@ -1723,97 +2849,133 @@ class OCRInspectionTool:
             padx=5
         )
 
+        self.file_label = ttk.Label(
 
-        # ====================================================
-        # BODY
-        # ====================================================
+            self.root,
 
-        body = ttk.Panedwindow(
-            main_frame,
+            text="No document loaded",
+
+            padding=(
+                8,
+                2,
+                8,
+                4
+            )
+        )
+
+        self.file_label.pack(
+            fill=tk.X
+        )
+
+        self.main_pane = ttk.PanedWindow(
+
+            self.root,
+
             orient=tk.HORIZONTAL
         )
 
-        body.pack(
+        self.main_pane.pack(
+
             fill=tk.BOTH,
-            expand=True
+
+            expand=True,
+
+            padx=5,
+
+            pady=5
         )
-
-
-        # ====================================================
-        # LEFT - DOCUMENT IMAGE
-        # ====================================================
 
         image_frame = ttk.Frame(
-            body
+            self.main_pane
         )
 
-        body.add(
+        result_frame = ttk.Frame(
+            self.main_pane,
+            width=430
+        )
+
+        self.main_pane.add(
             image_frame,
-            weight=4
+            weight=5
         )
 
+        self.main_pane.add(
+            result_frame,
+            weight=1
+        )
+
+
+        # ====================================================
+        # DOCUMENT CANVAS
+        # ====================================================
 
         self.canvas = tk.Canvas(
+
             image_frame,
-            bg="#333333"
+
+            bg="#383838",
+
+            highlightthickness=0,
+
+            cursor="fleur"
         )
 
-
         x_scroll = ttk.Scrollbar(
+
             image_frame,
 
             orient=tk.HORIZONTAL,
 
-            command=
-                self.canvas.xview
+            command=self.canvas.xview
         )
 
-
         y_scroll = ttk.Scrollbar(
+
             image_frame,
 
             orient=tk.VERTICAL,
 
-            command=
-                self.canvas.yview
+            command=self.canvas.yview
         )
-
 
         self.canvas.configure(
-            xscrollcommand=
-                x_scroll.set,
 
-            yscrollcommand=
-                y_scroll.set
+            xscrollcommand=x_scroll.set,
+
+            yscrollcommand=y_scroll.set
         )
 
-
         self.canvas.grid(
+
             row=0,
+
             column=0,
+
             sticky="nsew"
         )
 
-
         y_scroll.grid(
+
             row=0,
+
             column=1,
+
             sticky="ns"
         )
 
-
         x_scroll.grid(
+
             row=1,
+
             column=0,
+
             sticky="ew"
         )
-
 
         image_frame.rowconfigure(
             0,
             weight=1
         )
-
 
         image_frame.columnconfigure(
             0,
@@ -1822,412 +2984,917 @@ class OCRInspectionTool:
 
 
         # ====================================================
-        # RIGHT - OCR RESULTS
+        # MOUSE CONTROLS
         # ====================================================
 
-        result_frame = ttk.Frame(
-            body,
-
-            padding=(
-                8,
-                0,
-                0,
-                0
-            )
+        self.canvas.bind(
+            "<MouseWheel>",
+            self.mouse_zoom
         )
 
-        body.add(
-            result_frame,
-            weight=2
+        self.canvas.bind(
+            "<Shift-MouseWheel>",
+            self.horizontal_scroll
+        )
+
+        self.canvas.bind(
+            "<ButtonPress-1>",
+            self.start_pan
+        )
+
+        self.canvas.bind(
+            "<B1-Motion>",
+            self.drag_pan
+        )
+
+        self.canvas.bind(
+            "<ButtonPress-2>",
+            self.start_pan
+        )
+
+        self.canvas.bind(
+            "<B2-Motion>",
+            self.drag_pan
+        )
+
+        self.canvas.bind(
+            "<Double-Button-1>",
+            lambda event:
+                self.fit_page()
         )
 
 
-        title = ttk.Label(
+        # ====================================================
+        # RESULT PANEL
+        # ====================================================
+
+        ttk.Label(
+
             result_frame,
 
-            text="Detected regions / OCR",
+            text="YOLO / OCR detections",
 
             font=(
                 "Segoe UI",
-                11,
+                10,
                 "bold"
+            )
+
+        ).pack(
+
+            anchor="w",
+
+            pady=(
+                2,
+                5
             )
         )
 
-        title.pack(
-            anchor="w",
-            pady=(0, 5)
-        )
-
-
         columns = (
+
+            "no",
+
             "class",
-            "text",
-            "yolo",
-            "ocr",
-            "variant"
+
+            "raw",
+
+            "final",
+
+            "det_conf",
+
+            "ocr_conf",
+
+            "warning"
         )
 
-
-        self.result_table = ttk.Treeview(
-            result_frame,
-
-            columns=columns,
-
-            show="headings",
-
-            selectmode="browse"
+        table_container = ttk.Frame(
+            result_frame
         )
 
-
-        self.result_table.heading(
-            "class",
-            text="Class"
-        )
-
-        self.result_table.heading(
-            "text",
-            text="OCR Text"
-        )
-
-        self.result_table.heading(
-            "yolo",
-            text="YOLO"
-        )
-
-        self.result_table.heading(
-            "ocr",
-            text="OCR"
-        )
-
-        self.result_table.heading(
-            "variant",
-            text="OCR Pass"
-        )
-
-
-        self.result_table.column(
-            "class",
-            width=120
-        )
-
-        self.result_table.column(
-            "text",
-            width=180
-        )
-
-        self.result_table.column(
-            "yolo",
-            width=55,
-            anchor="center"
-        )
-
-        self.result_table.column(
-            "ocr",
-            width=55,
-            anchor="center"
-        )
-
-        self.result_table.column(
-            "variant",
-            width=80
-        )
-
-
-        result_scroll = ttk.Scrollbar(
-            result_frame,
-
-            orient=tk.VERTICAL,
-
-            command=
-                self.result_table.yview
-        )
-
-
-        self.result_table.configure(
-            yscrollcommand=
-                result_scroll.set
-        )
-
-
-        self.result_table.pack(
-            side=tk.LEFT,
+        table_container.pack(
             fill=tk.BOTH,
             expand=True
         )
 
+        self.table = ttk.Treeview(
 
-        result_scroll.pack(
-            side=tk.RIGHT,
-            fill=tk.Y
+            table_container,
+
+            columns=columns,
+
+            show="headings"
+        )
+
+        headings = {
+
+            "no":
+                "#",
+
+            "class":
+                "Class",
+
+            "raw":
+                "Raw OCR",
+
+            "final":
+                "Final",
+
+            "det_conf":
+                "YOLO",
+
+            "ocr_conf":
+                "OCR",
+
+            "warning":
+                "!"
+        }
+
+        widths = {
+
+            "no":
+                35,
+
+            "class":
+                105,
+
+            "raw":
+                90,
+
+            "final":
+                90,
+
+            "det_conf":
+                50,
+
+            "ocr_conf":
+                50,
+
+            "warning":
+                30
+        }
+
+        for column in columns:
+
+            self.table.heading(
+
+                column,
+
+                text=headings[
+                    column
+                ]
+            )
+
+            self.table.column(
+
+                column,
+
+                width=widths[
+                    column
+                ],
+
+                minwidth=30,
+
+                anchor="w"
+            )
+
+        table_y_scroll = ttk.Scrollbar(
+
+            table_container,
+
+            orient=tk.VERTICAL,
+
+            command=self.table.yview
+        )
+
+        table_x_scroll = ttk.Scrollbar(
+
+            table_container,
+
+            orient=tk.HORIZONTAL,
+
+            command=self.table.xview
+        )
+
+        self.table.configure(
+
+            yscrollcommand=
+                table_y_scroll.set,
+
+            xscrollcommand=
+                table_x_scroll.set
+        )
+
+        self.table.grid(
+
+            row=0,
+
+            column=0,
+
+            sticky="nsew"
+        )
+
+        table_y_scroll.grid(
+
+            row=0,
+
+            column=1,
+
+            sticky="ns"
+        )
+
+        table_x_scroll.grid(
+
+            row=1,
+
+            column=0,
+
+            sticky="ew"
+        )
+
+        table_container.rowconfigure(
+            0,
+            weight=1
+        )
+
+        table_container.columnconfigure(
+            0,
+            weight=1
+        )
+
+        self.table.bind(
+
+            "<<TreeviewSelect>>",
+
+            self.select_detection
+        )
+
+        ttk.Label(
+
+            result_frame,
+
+            text=(
+                "Wheel: zoom   |   "
+                "Drag: move page   |   "
+                "Shift+wheel: horizontal"
+            ),
+
+            foreground="#666666",
+
+            padding=(0, 5)
+
+        ).pack(
+            anchor="w"
+        )
+
+        self._set_navigation_state()
+
+
+    # ========================================================
+    # STATUS
+    # ========================================================
+
+    def set_status(
+        self,
+        text,
+        colour="#174ea6"
+    ):
+
+        self.status_label.config(
+
+            text=text,
+
+            foreground=colour
         )
 
 
     # ========================================================
-    # UPDATE PAGE LABEL
-    # ========================================================
-
-    def update_page_label(self):
-
-        if (
-            self.file_path
-            and self.file_path.lower().endswith(
-                ".pdf"
-            )
-        ):
-
-            self.page_label.config(
-                text=(
-                    f"Page "
-                    f"{self.current_page + 1}"
-                    f"/"
-                    f"{self.pdf_pages}"
-                )
-            )
-
-        else:
-
-            self.page_label.config(
-                text=""
-            )
-
-
-    # ========================================================
-    # UPLOAD
+    # OPEN DOCUMENT
     # ========================================================
 
     def upload_file(self):
 
         path = filedialog.askopenfilename(
 
-            title="Select document",
+            title=(
+                "Select chemical document"
+            ),
 
             filetypes=[
+
                 (
                     "PDF and images",
 
-                    "*.pdf *.png *.jpg *.jpeg "
-                    "*.bmp *.tif *.tiff *.webp"
-                )
+                    "*.pdf "
+                    "*.png "
+                    "*.jpg "
+                    "*.jpeg "
+                    "*.bmp "
+                    "*.tif "
+                    "*.tiff"
+                ),
+
+                (
+                    "PDF",
+                    "*.pdf"
+                ),
+
+                (
+                    "Images",
+                    "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"
+                ),
             ]
         )
 
         if not path:
+
             return
 
-        self.file_path = path
+        self.file_path = Path(
+            path
+        )
 
         self.current_page = 0
 
-        self.file_label.config(
-            text=os.path.basename(
-                path
-            )
-        )
-
-        extension = os.path.splitext(
-            path
-        )[1].lower()
-
         try:
 
-            if extension == ".pdf":
+            if (
+                self.file_path
+                .suffix
+                .lower()
+                == ".pdf"
+            ):
 
-                doc = fitz.open(
-                    path
-                )
-
-                self.pdf_pages = len(
-                    doc
-                )
-
-                doc.close()
-
-                self.current_image = (
-                    pdf_page_to_rgb(
-                        path,
-                        0
+                with pymupdf.open(
+                    str(
+                        self.file_path
                     )
-                )
+                ) as document:
+
+                    self.pdf_pages = (
+                        document.page_count
+                    )
 
             else:
 
                 self.pdf_pages = 1
 
-                self.current_image = (
-                    load_image_rgb(
-                        path
-                    )
-                )
+            self.load_current_page()
 
-            self.annotated_image = None
+            self.file_label.config(
 
-            self.detections = []
-
-            self.clear_results()
-
-            self.show_image(
-                self.current_image
-            )
-
-            self.update_page_label()
-
-            self.status_label.config(
-                text=(
-                    "Document loaded. "
-                    "Click 'Run Detection + OCR'."
+                text=str(
+                    self.file_path
                 )
             )
 
-        except Exception as e:
+            self.set_status(
+                "Document loaded."
+            )
+
+        except Exception as error:
+
+            self.file_path = None
 
             messagebox.showerror(
-                "Error",
-                str(e)
+
+                "Open failed",
+
+                str(
+                    error
+                )
             )
 
 
     # ========================================================
-    # LOAD CURRENT PDF PAGE
+    # LOAD PAGE
     # ========================================================
 
-    def load_current_pdf_page(self):
+    def load_current_page(self):
 
         if not self.file_path:
+
             return
 
-        if not self.file_path.lower().endswith(
-            ".pdf"
+        if (
+            self.file_path
+            .suffix
+            .lower()
+            == ".pdf"
         ):
-            return
 
-        self.current_image = (
-            pdf_page_to_rgb(
-                self.file_path,
-                self.current_page
+            self.current_image = (
+                pdf_page_to_rgb(
+
+                    self.file_path,
+
+                    self.current_page
+                )
             )
-        )
+
+        else:
+
+            self.current_image = (
+                load_image_rgb(
+                    self.file_path
+                )
+            )
 
         self.annotated_image = None
 
         self.detections = []
 
-        self.clear_results()
+        self.clear_table()
 
-        self.show_image(
-            self.current_image
+        self.page_label.config(
+
+            text=(
+                f"Page "
+                f"{self.current_page + 1}"
+                f" / "
+                f"{self.pdf_pages}"
+            )
         )
 
-        self.update_page_label()
+        self._set_navigation_state()
 
-        self.status_label.config(
-            text="PDF page loaded."
+        self.root.after(
+            80,
+            self.fit_page
         )
 
 
     # ========================================================
-    # PREVIOUS PAGE
+    # CHANGE PAGE
     # ========================================================
 
-    def previous_page(self):
-
-        if (
-            not self.file_path
-            or not self.file_path.lower().endswith(
-                ".pdf"
-            )
-        ):
-            return
-
-        if self.current_page > 0:
-
-            self.current_page -= 1
-
-            self.load_current_pdf_page()
-
-
-    # ========================================================
-    # NEXT PAGE
-    # ========================================================
-
-    def next_page(self):
-
-        if (
-            not self.file_path
-            or not self.file_path.lower().endswith(
-                ".pdf"
-            )
-        ):
-            return
-
-        if (
-            self.current_page
-            < self.pdf_pages - 1
-        ):
-
-            self.current_page += 1
-
-            self.load_current_pdf_page()
-
-
-    # ========================================================
-    # CLEAR RESULT TABLE
-    # ========================================================
-
-    def clear_results(self):
-
-        for item in (
-            self.result_table.get_children()
-        ):
-
-            self.result_table.delete(
-                item
-            )
-
-
-    # ========================================================
-    # POPULATE RESULTS
-    # ========================================================
-
-    def populate_results(
+    def change_page(
         self,
-        detections
+        direction
     ):
 
-        self.clear_results()
+        if (
+            self.busy
+            or not self.file_path
+        ):
 
-        sorted_detections = sorted(
+            return
+
+        new_page = (
+            self.current_page
+            + direction
+        )
+
+        if (
+            0
+            <= new_page
+            < self.pdf_pages
+        ):
+
+            self.current_page = (
+                new_page
+            )
+
+            try:
+
+                self.load_current_page()
+
+                self.set_status(
+                    "Page loaded."
+                )
+
+            except Exception as error:
+
+                messagebox.showerror(
+
+                    "Page error",
+
+                    str(
+                        error
+                    )
+                )
+
+
+    # ========================================================
+    # NAVIGATION STATE
+    # ========================================================
+
+    def _set_navigation_state(self):
+
+        previous = (
+
+            tk.NORMAL
+
+            if (
+                self.file_path
+                and self.current_page > 0
+                and not self.busy
+            )
+
+            else tk.DISABLED
+        )
+
+        following = (
+
+            tk.NORMAL
+
+            if (
+                self.file_path
+                and
+                self.current_page
+                < self.pdf_pages - 1
+                and not self.busy
+            )
+
+            else tk.DISABLED
+        )
+
+        self.previous_button.config(
+            state=previous
+        )
+
+        self.next_button.config(
+            state=following
+        )
+
+
+    # ========================================================
+    # TOGGLE OVERLAY
+    # ========================================================
+
+    def toggle_overlay(self):
+
+        global SHOW_OVERLAY
+
+        SHOW_OVERLAY = (
+            not SHOW_OVERLAY
+        )
+
+        if SHOW_OVERLAY:
+
+            self.overlay_button.config(
+                text="Hide OCR Overlay"
+            )
+
+        else:
+
+            self.overlay_button.config(
+                text="Show OCR Overlay"
+            )
+
+        image = (
+            self.get_display_image()
+        )
+
+        if image is not None:
+
+            self.show_image(
+                image,
+                keep_view=True
+            )
+
+
+    # ========================================================
+    # START YOLO + OCR
+    # ========================================================
+
+    def start_inspection(self):
+
+        if self.current_image is None:
+
+            messagebox.showwarning(
+
+                "No document",
+
+                "Open a PDF or image first."
+            )
+
+            return
+
+        if self.busy:
+
+            return
+
+        self.busy = True
+
+        self.open_button.config(
+            state=tk.DISABLED
+        )
+
+        self.run_button.config(
+            state=tk.DISABLED
+        )
+
+        self._set_navigation_state()
+
+        self.set_status(
+            "Running YOLO..."
+        )
+
+        image = (
+            self.current_image.copy()
+        )
+
+        threading.Thread(
+
+            target=self._process_image,
+
+            args=(image,),
+
+            daemon=True
+
+        ).start()
+
+
+    # ========================================================
+    # PROCESS IMAGE
+    # ========================================================
+
+    def _process_image(
+        self,
+        image
+    ):
+
+        try:
+
+            result = self.model.predict(
+
+                source=image,
+
+                imgsz=IMAGE_SIZE,
+
+                conf=CONFIDENCE,
+
+                iou=IOU_THRESHOLD,
+
+                max_det=MAX_DETECTIONS,
+
+                device=DEVICE,
+
+                verbose=False
+
+            )[0]
+
+            detections = []
+
+            if (
+                result.boxes
+                is not None
+            ):
+
+                for box in result.boxes:
+
+                    class_id = int(
+
+                        box.cls[0]
+                        .cpu()
+                        .item()
+                    )
+
+                    coordinates = (
+
+                        box.xyxy[0]
+                        .cpu()
+                        .numpy()
+                        .round()
+                        .astype(int)
+                    )
+
+                    (
+                        x1,
+                        y1,
+                        x2,
+                        y2
+                    ) = coordinates
+
+                    x1 = max(
+                        0,
+                        x1
+                    )
+
+                    y1 = max(
+                        0,
+                        y1
+                    )
+
+                    x2 = min(
+                        image.shape[1],
+                        x2
+                    )
+
+                    y2 = min(
+                        image.shape[0],
+                        y2
+                    )
+
+                    detections.append({
+
+                        "class_id":
+                            class_id,
+
+                        "class_name":
+                            str(
+                                self.model.names[
+                                    class_id
+                                ]
+                            ),
+
+                        "det_conf":
+                            float(
+                                box.conf[0]
+                                .cpu()
+                                .item()
+                            ),
+
+                        "x1":
+                            x1,
+
+                        "y1":
+                            y1,
+
+                        "x2":
+                            x2,
+
+                        "y2":
+                            y2,
+
+                        "cx":
+                            (
+                                x1 + x2
+                            ) / 2.0,
+
+                        "cy":
+                            (
+                                y1 + y2
+                            ) / 2.0,
+                    })
+
+            detections = (
+                sort_reading_order(
+                    detections
+                )
+            )
+
+            total = len(
+                detections
+            )
+
+            for index, detection in enumerate(
+
+                detections,
+
+                start=1
+            ):
+
+                if (
+                    index == 1
+                    or index % 10 == 0
+                    or index == total
+                ):
+
+                    self.root.after(
+
+                        0,
+
+                        self.set_status,
+
+                        f"OCR "
+                        f"{index}"
+                        f" / "
+                        f"{total}"
+                    )
+
+                (
+                    final_text,
+                    ocr_conf,
+                    mapped,
+                    raw_text
+
+                ) = read_crop_text(
+
+                    self.reader,
+
+                    image,
+
+                    detection
+                )
+
+                detection[
+                    "text"
+                ] = final_text
+
+                detection[
+                    "raw_text"
+                ] = raw_text
+
+                detection[
+                    "ocr_conf"
+                ] = ocr_conf
+
+                detection[
+                    "mapped"
+                ] = mapped
+
+                detection[
+                    "warning"
+                ] = (
+
+                    not final_text
+
+                    or
+                    ocr_conf
+                    < OCR_MIN_CONFIDENCE
+
+                    or
+                    not mapped
+                )
+
+            overlay = draw_overlay(
+
+                image,
+
+                detections
+            )
+
+            self.root.after(
+
+                0,
+
+                self._inspection_complete,
+
+                detections,
+
+                overlay
+            )
+
+        except Exception as error:
+
+            self.root.after(
+
+                0,
+
+                self._inspection_failed,
+
+                str(
+                    error
+                )
+            )
+
+
+    # ========================================================
+    # COMPLETE
+    # ========================================================
+
+    def _inspection_complete(
+        self,
+        detections,
+        overlay
+    ):
+
+        self.detections = (
+            detections
+        )
+
+        self.annotated_image = (
+            overlay
+        )
+
+        self.clear_table()
+
+        for index, detection in enumerate(
 
             detections,
 
-            key=lambda d: (
-                d["y1"],
-                d["x1"]
-            )
-        )
+            start=1
+        ):
 
-        for detection in sorted_detections:
-
-            yolo_conf = detection.get(
-                "yolo_confidence",
-                0
+            warning = (
+                "⚠"
+                if detection[
+                    "warning"
+                ]
+                else ""
             )
 
-            ocr_conf = detection.get(
-                "ocr_confidence",
-                0
-            )
-
-            self.result_table.insert(
+            self.table.insert(
 
                 "",
 
                 tk.END,
 
+                iid=str(
+                    index - 1
+                ),
+
                 values=(
 
+                    index,
+
+                    detection[
+                        "class_name"
+                    ],
+
                     detection.get(
-                        "class_name",
+                        "raw_text",
                         ""
                     ),
 
@@ -2236,203 +3903,126 @@ class OCRInspectionTool:
                         ""
                     ),
 
-                    f"{yolo_conf:.2f}",
+                    f'{detection["det_conf"]:.0%}',
 
-                    f"{ocr_conf:.2f}",
+                    f'{detection.get("ocr_conf", 0):.0%}',
 
-                    detection.get(
-                        "ocr_variant",
-                        ""
-                    )
+                    warning
                 )
+            )
+
+        self.fit_page()
+
+        self.busy = False
+
+        self.open_button.config(
+            state=tk.NORMAL
+        )
+
+        self.run_button.config(
+            state=tk.NORMAL
+        )
+
+        self._set_navigation_state()
+
+        warnings = sum(
+
+            bool(
+                d["warning"]
+            )
+
+            for d
+            in detections
+        )
+
+        recognised = sum(
+
+            bool(
+                d.get(
+                    "text"
+                )
+            )
+
+            for d
+            in detections
+        )
+
+        self.set_status(
+
+            f"{len(detections)} boxes | "
+            f"{recognised} OCR | "
+            f"{warnings} warnings",
+
+            "#137333"
+        )
+
+
+    # ========================================================
+    # FAILED
+    # ========================================================
+
+    def _inspection_failed(
+        self,
+        error
+    ):
+
+        self.busy = False
+
+        self.open_button.config(
+            state=tk.NORMAL
+        )
+
+        self.run_button.config(
+            state=tk.NORMAL
+        )
+
+        self._set_navigation_state()
+
+        self.set_status(
+
+            "Processing failed.",
+
+            "#b3261e"
+        )
+
+        messagebox.showerror(
+
+            "YOLO / OCR error",
+
+            error
+        )
+
+
+    # ========================================================
+    # CLEAR TABLE
+    # ========================================================
+
+    def clear_table(self):
+
+        for item in (
+            self.table.get_children()
+        ):
+
+            self.table.delete(
+                item
             )
 
 
     # ========================================================
-    # RUN DETECTION + OCR
+    # DISPLAY IMAGE SOURCE
     # ========================================================
 
-    def run_inspection(self):
+    def get_display_image(self):
 
-        if self.current_image is None:
+        if (
+            SHOW_OVERLAY
+            and self.annotated_image
+            is not None
+        ):
 
-            messagebox.showwarning(
-                "Warning",
-                "Please upload a document first."
-            )
+            return self.annotated_image
 
-            return
-
-        try:
-
-            # ------------------------------------------------
-            # YOLO
-            # ------------------------------------------------
-
-            self.status_label.config(
-                text=
-                    "Detecting regions with YOLO..."
-            )
-
-            self.root.update_idletasks()
-
-            detections = run_yolo(
-                self.current_image
-            )
-
-
-            self.status_label.config(
-                text=(
-                    f"Detected "
-                    f"{len(detections)} regions. "
-                    f"Running OCR..."
-                )
-            )
-
-            self.root.update_idletasks()
-
-
-            # ------------------------------------------------
-            # OCR
-            # ------------------------------------------------
-
-            for index, detection in enumerate(
-                detections,
-                start=1
-            ):
-
-                self.status_label.config(
-                    text=(
-                        f"OCR "
-                        f"{index}/"
-                        f"{len(detections)}"
-                    )
-                )
-
-                self.root.update_idletasks()
-
-                ocr_result = read_crop_text(
-                    self.current_image,
-                    detection
-                )
-
-                detection.update(
-                    ocr_result
-                )
-
-
-            # ------------------------------------------------
-            # STORE
-            # ------------------------------------------------
-
-            self.detections = detections
-
-
-            # ------------------------------------------------
-            # DRAW
-            # ------------------------------------------------
-
-            self.status_label.config(
-                text=
-                    "Rendering OCR overlay..."
-            )
-
-            self.root.update_idletasks()
-
-            self.annotated_image = (
-                draw_ocr_overlay(
-                    self.current_image,
-                    detections
-                )
-            )
-
-            self.show_image(
-                self.annotated_image
-            )
-
-
-            # ------------------------------------------------
-            # TABLE
-            # ------------------------------------------------
-
-            self.populate_results(
-                detections
-            )
-
-
-            # ------------------------------------------------
-            # SUMMARY
-            # ------------------------------------------------
-
-            recognized = sum(
-                1
-                for d in detections
-                if d.get(
-                    "text",
-                    ""
-                )
-            )
-
-            class_counts = {}
-
-            for d in detections:
-
-                name = d.get(
-                    "class_name",
-                    "unknown"
-                )
-
-                class_counts[name] = (
-                    class_counts.get(
-                        name,
-                        0
-                    ) + 1
-                )
-
-            print("\n" + "=" * 70)
-            print("DETECTION SUMMARY")
-            print("=" * 70)
-
-            for name in EXPECTED_CLASSES:
-
-                print(
-                    f"{name:18s}: "
-                    f"{class_counts.get(name, 0)}"
-                )
-
-            print("-" * 70)
-
-            print(
-                "Total detections:",
-                len(detections)
-            )
-
-            print(
-                "OCR recognized :",
-                recognized
-            )
-
-            print("=" * 70)
-
-
-            self.status_label.config(
-                text=(
-                    f"Complete: "
-                    f"{len(detections)} boxes, "
-                    f"{recognized} OCR results."
-                )
-            )
-
-        except Exception as e:
-
-            messagebox.showerror(
-                "Error",
-                str(e)
-            )
-
-            self.status_label.config(
-                text="Processing failed."
-            )
+        return self.current_image
 
 
     # ========================================================
@@ -2441,21 +4031,73 @@ class OCRInspectionTool:
 
     def show_image(
         self,
-        image
+        image,
+        keep_view=False
     ):
 
         if image is None:
+
             return
 
-        h, w = image.shape[:2]
+        old_x = (
+            self.canvas.xview()
+        )
 
-        pil_image = Image.fromarray(
-            image
+        old_y = (
+            self.canvas.yview()
+        )
+
+        height, width = (
+            image.shape[:2]
+        )
+
+        shown_width = max(
+
+            1,
+
+            int(
+                width
+                * self.zoom
+            )
+        )
+
+        shown_height = max(
+
+            1,
+
+            int(
+                height
+                * self.zoom
+            )
+        )
+
+        interpolation = (
+
+            cv2.INTER_AREA
+
+            if self.zoom < 1.0
+
+            else cv2.INTER_CUBIC
+        )
+
+        shown = cv2.resize(
+
+            image,
+
+            (
+                shown_width,
+                shown_height
+            ),
+
+            interpolation=interpolation
         )
 
         self.tk_image = (
+
             ImageTk.PhotoImage(
-                pil_image
+                Image.fromarray(
+                    shown
+                )
             )
         )
 
@@ -2463,35 +4105,734 @@ class OCRInspectionTool:
             "all"
         )
 
-        self.canvas.create_image(
-            0,
-            0,
+        self.image_item = (
+            self.canvas.create_image(
 
-            anchor=tk.NW,
+                0,
 
-            image=self.tk_image
+                0,
+
+                anchor=tk.NW,
+
+                image=self.tk_image
+            )
         )
 
         self.canvas.configure(
+
             scrollregion=(
+
                 0,
+
                 0,
-                w,
-                h
+
+                shown_width,
+
+                shown_height
+            )
+        )
+
+        self.zoom_label.config(
+
+            text=(
+                f"{self.zoom * 100:.0f}%"
+            )
+        )
+
+        if keep_view:
+
+            if old_x:
+
+                self.canvas.xview_moveto(
+                    old_x[0]
+                )
+
+            if old_y:
+
+                self.canvas.yview_moveto(
+                    old_y[0]
+                )
+
+
+    # ========================================================
+    # FIT PAGE
+    # ========================================================
+
+    def fit_page(self):
+
+        image = (
+            self.get_display_image()
+        )
+
+        if image is None:
+
+            return
+
+        self.root.update_idletasks()
+
+        available_width = max(
+
+            100,
+
+            self.canvas.winfo_width()
+            - 20
+        )
+
+        available_height = max(
+
+            100,
+
+            self.canvas.winfo_height()
+            - 20
+        )
+
+        image_height, image_width = (
+            image.shape[:2]
+        )
+
+        self.zoom = min(
+
+            available_width
+            / image_width,
+
+            available_height
+            / image_height
+        )
+
+        self.zoom = max(
+
+            self.min_zoom,
+
+            min(
+                self.zoom,
+                self.max_zoom
+            )
+        )
+
+        self.show_image(
+            image
+        )
+
+        self.canvas.xview_moveto(
+            0
+        )
+
+        self.canvas.yview_moveto(
+            0
+        )
+
+
+    # ========================================================
+    # FIT WIDTH
+    # ========================================================
+
+    def fit_width(self):
+
+        image = (
+            self.get_display_image()
+        )
+
+        if image is None:
+
+            return
+
+        self.root.update_idletasks()
+
+        available_width = max(
+
+            100,
+
+            self.canvas.winfo_width()
+            - 20
+        )
+
+        image_width = (
+            image.shape[1]
+        )
+
+        self.zoom = (
+
+            available_width
+            / image_width
+        )
+
+        self.zoom = max(
+
+            self.min_zoom,
+
+            min(
+                self.zoom,
+                self.max_zoom
+            )
+        )
+
+        self.show_image(
+            image
+        )
+
+        self.canvas.xview_moveto(
+            0
+        )
+
+        self.canvas.yview_moveto(
+            0
+        )
+
+
+    # ========================================================
+    # 100%
+    # ========================================================
+
+    def reset_zoom(self):
+
+        image = (
+            self.get_display_image()
+        )
+
+        if image is None:
+
+            return
+
+        self.zoom = 1.0
+
+        self.show_image(
+            image
+        )
+
+
+    # ========================================================
+    # BUTTON ZOOM
+    # ========================================================
+
+    def zoom_button(
+        self,
+        factor
+    ):
+
+        image = (
+            self.get_display_image()
+        )
+
+        if image is None:
+
+            return
+
+        new_zoom = (
+
+            self.zoom
+            * factor
+        )
+
+        new_zoom = max(
+
+            self.min_zoom,
+
+            min(
+                self.max_zoom,
+                new_zoom
+            )
+        )
+
+        self.zoom = new_zoom
+
+        self.show_image(
+
+            image,
+
+            keep_view=True
+        )
+
+
+    # ========================================================
+    # MOUSE ZOOM
+    # ========================================================
+
+    def mouse_zoom(
+        self,
+        event
+    ):
+
+        image = (
+            self.get_display_image()
+        )
+
+        if image is None:
+
+            return "break"
+
+        canvas_x = (
+            self.canvas.canvasx(
+                event.x
+            )
+        )
+
+        canvas_y = (
+            self.canvas.canvasy(
+                event.y
+            )
+        )
+
+        old_zoom = (
+            self.zoom
+        )
+
+        if event.delta > 0:
+
+            factor = 1.20
+
+        else:
+
+            factor = (
+                1 / 1.20
+            )
+
+        new_zoom = (
+
+            old_zoom
+            * factor
+        )
+
+        new_zoom = max(
+
+            self.min_zoom,
+
+            min(
+                self.max_zoom,
+                new_zoom
+            )
+        )
+
+        if abs(
+            new_zoom
+            - old_zoom
+        ) < 0.00001:
+
+            return "break"
+
+        image_x = (
+            canvas_x
+            / old_zoom
+        )
+
+        image_y = (
+            canvas_y
+            / old_zoom
+        )
+
+        self.zoom = (
+            new_zoom
+        )
+
+        self.show_image(
+            image
+        )
+
+        new_canvas_x = (
+            image_x
+            * new_zoom
+        )
+
+        new_canvas_y = (
+            image_y
+            * new_zoom
+        )
+
+        bbox = (
+            self.canvas.bbox(
+                "all"
+            )
+        )
+
+        if bbox:
+
+            total_width = max(
+                1,
+                bbox[2]
+                - bbox[0]
+            )
+
+            total_height = max(
+                1,
+                bbox[3]
+                - bbox[1]
+            )
+
+            desired_left = (
+
+                new_canvas_x
+                - event.x
+            )
+
+            desired_top = (
+
+                new_canvas_y
+                - event.y
+            )
+
+            self.canvas.xview_moveto(
+
+                max(
+                    0.0,
+
+                    min(
+                        1.0,
+
+                        desired_left
+                        / total_width
+                    )
+                )
+            )
+
+            self.canvas.yview_moveto(
+
+                max(
+                    0.0,
+
+                    min(
+                        1.0,
+
+                        desired_top
+                        / total_height
+                    )
+                )
+            )
+
+        return "break"
+
+
+    # ========================================================
+    # HORIZONTAL SCROLL
+    # ========================================================
+
+    def horizontal_scroll(
+        self,
+        event
+    ):
+
+        direction = (
+
+            -3
+
+            if event.delta > 0
+
+            else 3
+        )
+
+        self.canvas.xview_scroll(
+
+            direction,
+
+            "units"
+        )
+
+        return "break"
+
+
+    # ========================================================
+    # PAN
+    # ========================================================
+
+    def start_pan(
+        self,
+        event
+    ):
+
+        self.canvas.scan_mark(
+
+            event.x,
+
+            event.y
+        )
+
+
+    def drag_pan(
+        self,
+        event
+    ):
+
+        self.canvas.scan_dragto(
+
+            event.x,
+
+            event.y,
+
+            gain=1
+        )
+
+
+    # ========================================================
+    # SELECT RESULT
+    # ========================================================
+
+    def select_detection(
+        self,
+        _event=None
+    ):
+
+        selection = (
+            self.table.selection()
+        )
+
+        if (
+            not selection
+            or not self.detections
+        ):
+
+            return
+
+        index = int(
+            selection[0]
+        )
+
+        detection = (
+            self.detections[
+                index
+            ]
+        )
+
+        if self.zoom < 0.65:
+
+            self.zoom = 0.90
+
+            self.show_image(
+                self.get_display_image()
+            )
+
+        target_x = (
+            detection["cx"]
+            * self.zoom
+        )
+
+        target_y = (
+            detection["cy"]
+            * self.zoom
+        )
+
+        bbox = (
+            self.canvas.bbox(
+                "all"
+            )
+        )
+
+        if not bbox:
+
+            return
+
+        total_width = max(
+
+            1,
+
+            bbox[2]
+        )
+
+        total_height = max(
+
+            1,
+
+            bbox[3]
+        )
+
+        view_width = (
+            self.canvas.winfo_width()
+        )
+
+        view_height = (
+            self.canvas.winfo_height()
+        )
+
+        x_fraction = (
+
+            target_x
+            - view_width / 2
+
+        ) / total_width
+
+        y_fraction = (
+
+            target_y
+            - view_height / 2
+
+        ) / total_height
+
+        self.canvas.xview_moveto(
+
+            max(
+                0,
+
+                min(
+                    1,
+                    x_fraction
+                )
+            )
+        )
+
+        self.canvas.yview_moveto(
+
+            max(
+                0,
+
+                min(
+                    1,
+                    y_fraction
+                )
             )
         )
 
 
 # ============================================================
-# START GUI
+# VERIFY MODEL
 # ============================================================
 
-if __name__ == "__main__":
+def verify_model_classes(
+    model
+):
+
+    actual = {
+
+        int(key):
+            str(value)
+
+        for key, value
+        in model.names.items()
+    }
+
+    if actual != EXPECTED_CLASSES:
+
+        raise ValueError(
+
+            "Loaded YOLO model does not match "
+            "the expected six-class structure.\n\n"
+
+            f"EXPECTED:\n"
+            f"{EXPECTED_CLASSES}\n\n"
+
+            f"ACTUAL:\n"
+            f"{actual}\n\n"
+
+            f"Model:\n"
+            f"{MODEL_PATH}"
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print()
+    print("=" * 70)
+
+    print(
+        "LOADING YOLO MODEL"
+    )
+
+    print("=" * 70)
+
+    print(
+        "Model:",
+        MODEL_PATH
+    )
+
+    print(
+        "Device:",
+        DEVICE
+    )
+
+    if not MODEL_PATH.exists():
+
+        raise FileNotFoundError(
+
+            f"YOLO model not found:\n"
+            f"{MODEL_PATH}"
+        )
+
+    model = YOLO(
+        str(
+            MODEL_PATH
+        )
+    )
+
+    verify_model_classes(
+        model
+    )
+
+    print()
+    print(
+        "YOLO loaded successfully."
+    )
+
+    print(
+        "Model classes:"
+    )
+
+    print("-" * 70)
+
+    for class_id, class_name in (
+        model.names.items()
+    ):
+
+        print(
+
+            f"{class_id}: "
+            f"{class_name}"
+        )
+
+    print("-" * 70)
+
+    print()
+    print("=" * 70)
+
+    print(
+        "LOADING EASYOCR"
+    )
+
+    print("=" * 70)
+
+    gpu_available = (
+        torch.cuda.is_available()
+    )
+
+    print(
+        "CUDA available:",
+        gpu_available
+    )
+
+    print(
+        "EasyOCR GPU    :",
+        gpu_available
+    )
+
+    reader = easyocr.Reader(
+
+        ["en"],
+
+        gpu=gpu_available
+    )
+
+    print()
+    print(
+        "EasyOCR loaded successfully."
+    )
 
     root = tk.Tk()
 
     app = OCRInspectionTool(
-        root
+
+        root,
+
+        model,
+
+        reader
     )
 
     root.mainloop()
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
