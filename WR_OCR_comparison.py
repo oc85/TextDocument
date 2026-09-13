@@ -11,8 +11,8 @@
 # - Left mouse drag = pan document
 # - Shift + mouse wheel = horizontal movement
 # - Previous / next PDF page
-# - YOLO detection
-# - EasyOCR
+# - Separate YOLO, YOLO colours-only and YOLO + OCR buttons
+# - EasyOCR loaded only when YOLO + OCR is requested
 # - Manual OCR mapping dictionaries near TOP of code
 # - Raw OCR + corrected OCR in result table
 # - Clean non-obstructive OCR overlay
@@ -46,13 +46,14 @@
 # 1 element_value
 # 2 unit
 # 3 limit_indicator
-# 4 value_range
-# 5 sign
+# 4 table             (YOLO only - no OCR)
+# 5 headers           (OCR applied in YOLO + OCR mode)
 #
 # ============================================================
 
 import re
 import threading
+import time
 from pathlib import Path
 
 import tkinter as tk
@@ -73,14 +74,20 @@ from ultralytics import YOLO
 # ============================================================
 
 MODEL_PATH = Path(
-    r"D:\Kaggle\WRtools_003\best.pt"
+    r"D:\Kaggle\WRtools_005\best.pt"
 )
 
 IMAGE_SIZE = 1280
 
 CONFIDENCE = 0.03
 
+# Standard same-class NMS threshold used by YOLO.
+# Cross-class overlap is handled separately below.
 IOU_THRESHOLD = 0.45
+
+# Non-table categories should not overlap by more than 5%.
+# The table category is excluded because it contains the others.
+NON_TABLE_MAX_OVERLAP = 0.05
 
 MAX_DETECTIONS = 2000
 
@@ -102,8 +109,28 @@ EXPECTED_CLASSES = {
     1: "element_value",
     2: "unit",
     3: "limit_indicator",
-    4: "value_range",
-    5: "sign",
+    4: "table",
+    5: "headers",
+}
+
+
+# OCR is used for text/token classes and header regions.
+# table remains a structural YOLO detection only.
+OCR_CLASSES = {
+    "element_symbol",
+    "element_value",
+    "unit",
+    "limit_indicator",
+    "headers",
+}
+
+STRUCTURAL_CLASSES = {
+    "table",
+    "headers",
+}
+
+NO_OCR_CLASSES = {
+    "table",
 }
 
 
@@ -190,6 +217,8 @@ ELEMENT_MAPPING = {
     # Silicon
     "si": "Si",
     "sl": "Si",
+    "s1": "Si",
+    "s|": "Si",
 
     # Tin
     "sn": "Sn",
@@ -199,6 +228,9 @@ ELEMENT_MAPPING = {
 
     # Titanium
     "ti": "Ti",
+
+    # Thallium
+    "tl": "Tl",
 
     # Vanadium
     "v": "V",
@@ -327,33 +359,22 @@ RANGE_MAPPING = {
 # ============================================================
 
 VALID_ELEMENTS = {
-    "Ag",
-    "Al",
-    "B",
-    "Bi",
-    "C",
-    "Cd",
-    "Co",
-    "Cr",
-    "Cu",
-    "Fe",
-    "Hf",
-    "Mn",
-    "Mo",
-    "Nb",
-    "Ni",
-    "P",
-    "Pb",
-    "Re",
-    "S",
-    "Sb",
-    "Si",
-    "Sn",
-    "Ta",
-    "Ti",
-    "V",
-    "W",
-    "Zr",
+    # Complete current periodic table. Using the complete set
+    # prevents correctly read symbols such as Se from being
+    # rejected merely because they were absent from a short
+    # project-specific list.
+    "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne",
+    "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca",
+    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+    "Ga", "Ge", "As", "Se", "Br", "Kr", "Rb", "Sr", "Y", "Zr",
+    "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In", "Sn",
+    "Sb", "Te", "I", "Xe", "Cs", "Ba", "La", "Ce", "Pr", "Nd",
+    "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb",
+    "Lu", "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
+    "Tl", "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th",
+    "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf", "Es", "Fm",
+    "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh", "Hs", "Mt", "Ds",
+    "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts", "Og",
 }
 
 
@@ -378,6 +399,18 @@ RANGE_PAD_Y = 0.05
 
 OCR_MIN_CONFIDENCE = 0.15
 
+# A chemical-symbol candidate must be strictly above 10%.
+SYMBOL_MIN_CONFIDENCE = 0.10
+
+
+# Valid visual-confusion fallbacks used only when the same
+# element symbol appears more than once inside one table.
+# Every fallback must itself be a real chemical element.
+DUPLICATE_SYMBOL_FALLBACKS = {
+    "Ti": ["Tl"],
+    "Tl": ["Ti"],
+}
+
 
 # ============================================================
 # 6. OVERLAY SETTINGS
@@ -397,7 +430,8 @@ OVERLAY_FONT_THICKNESS = 1
 
 OVERLAY_TEXT_PADDING = 3
 
-OVERLAY_LABEL_ALPHA = 0.58
+# Higher value gives a more opaque, easier-to-read label box.
+OVERLAY_LABEL_ALPHA = 0.82
 
 OVERLAY_MAX_TEXT_LENGTH = 22
 
@@ -420,11 +454,11 @@ CLASS_COLOURS = {
     "limit_indicator":
         (145, 70, 200),
 
-    "value_range":
-        (220, 40, 160),
+    "table":
+        (0, 190, 210),
 
-    "sign":
-        (40, 120, 220),
+    "headers":
+        (90, 95, 230),
 }
 
 
@@ -438,10 +472,45 @@ CLASS_SHORT = {
 
     "limit_indicator": "L",
 
-    "value_range": "R",
+    "table": "T",
 
-    "sign": "S",
+    "headers": "H",
 }
+
+
+def rgb_to_hex(
+    colour
+):
+
+    return "#{:02x}{:02x}{:02x}".format(
+        int(colour[0]),
+        int(colour[1]),
+        int(colour[2])
+    )
+
+
+def format_duration(
+    seconds
+):
+
+    seconds = max(
+        0.0,
+        float(seconds)
+    )
+
+    minutes = int(
+        seconds // 60
+    )
+
+    remaining_seconds = (
+        seconds
+        - minutes * 60
+    )
+
+    return (
+        f"{minutes:02d}m "
+        f"{remaining_seconds:05.2f}s"
+    )
 
 
 # ============================================================
@@ -1158,6 +1227,27 @@ def normalise_value(text):
 
         return "-", True
 
+    # Numeric ranges belong to element_value in the current
+    # six-class model.  EasyOCR's numeric pass may return the
+    # complete range, for example "26.0 - 30.0".  Keep both
+    # numbers and standardise the separator for display.
+    range_match = re.fullmatch(
+
+        r"([+-]?\d+(?:\.\d+)?)"
+        r"-"
+        r"([+-]?\d+(?:\.\d+)?)",
+
+        value
+    )
+
+    if range_match:
+
+        return (
+            f"{range_match.group(1)} - "
+            f"{range_match.group(2)}",
+            True
+        )
+
     if re.fullmatch(
         r"[+-]?\d+(?:\.\d+)?",
         value
@@ -1180,6 +1270,45 @@ def normalise_value(text):
         return original, True
 
     return value, False
+
+
+# ============================================================
+# NORMALISE HEADER
+# ============================================================
+
+def normalise_header(text):
+
+    original = clean_text(
+        text
+    )
+
+    if not original:
+
+        return "", False
+
+    # EasyOCR sometimes attaches one or two narrow characters
+    # from a nearby table border/cell to the word "Analysis".
+    # Correct only that short leading artefact; do not alter
+    # legitimate longer headers such as "Chemical Analysis".
+    compact = re.sub(
+        r"[^a-z]",
+        "",
+        original.lower()
+    )
+
+    if compact.endswith(
+        "analysis"
+    ):
+
+        prefix = compact[
+            :-len("analysis")
+        ]
+
+        if len(prefix) <= 2:
+
+            return "Analysis", True
+
+    return original, True
 
 
 # ============================================================
@@ -1454,6 +1583,13 @@ def read_element_value(
                     r"[<>]=?[+-]?\d+(?:\.\d+)?",
                     final
                 )
+                or
+                re.fullmatch(
+                    r"[+-]?\d+(?:\.\d+)?"
+                    r"\s+-\s+"
+                    r"[+-]?\d+(?:\.\d+)?",
+                    final
+                )
             )
         ):
 
@@ -1581,6 +1717,17 @@ def read_element_value(
             numeric_candidates,
 
             key=lambda item: (
+
+                # Prefer a complete numeric range over an OCR
+                # candidate containing only one endpoint.
+                bool(
+                    re.fullmatch(
+                        r"[+-]?\d+(?:\.\d+)?"
+                        r"\s+-\s+"
+                        r"[+-]?\d+(?:\.\d+)?",
+                        item["final"]
+                    )
+                ),
 
                 item[
                     "confidence"
@@ -1871,6 +2018,17 @@ def read_crop_text(
         "class_name"
     ]
 
+    # The complete table region is detected by YOLO only.
+    # Headers are allowed through and are read by EasyOCR.
+    if class_name in NO_OCR_CLASSES:
+
+        return (
+            "",
+            0.0,
+            True,
+            ""
+        )
+
     crop = padded_crop(
         image,
         detection
@@ -1945,6 +2103,92 @@ def read_crop_text(
             ""
         )
 
+    # --------------------------------------------------------
+    # ELEMENT SYMBOL CANDIDATES
+    #
+    # Keep the best confidence for every valid alternative.
+    # These alternatives are used later if the same symbol is
+    # recognised more than once inside one detected table.
+    # --------------------------------------------------------
+
+    if class_name == "element_symbol":
+
+        best_by_symbol = {}
+
+        for candidate in candidates:
+
+            if (
+                float(candidate["confidence"])
+                <= SYMBOL_MIN_CONFIDENCE
+            ):
+
+                continue
+
+            candidate_text, candidate_valid = (
+                normalise_element(
+                    candidate["raw"]
+                )
+            )
+
+            if not candidate_valid:
+
+                continue
+
+            previous = best_by_symbol.get(
+                candidate_text
+            )
+
+            if (
+                previous is None
+                or candidate["confidence"]
+                > previous["confidence"]
+            ):
+
+                best_by_symbol[candidate_text] = {
+                    "text": candidate_text,
+                    "raw": candidate["raw"],
+                    "confidence": float(
+                        candidate["confidence"]
+                    ),
+                }
+
+        symbol_alternatives = sorted(
+            best_by_symbol.values(),
+            key=lambda item:
+                item["confidence"],
+            reverse=True
+        )
+
+        detection["ocr_alternatives"] = (
+            symbol_alternatives
+        )
+
+        if symbol_alternatives:
+
+            best_symbol = symbol_alternatives[0]
+
+            return (
+                best_symbol["text"],
+                best_symbol["confidence"],
+                True,
+                best_symbol["raw"]
+            )
+
+        # Candidates existed, but none was both a valid element
+        # and above the required 10% confidence threshold.
+        rejected_best = max(
+            candidates,
+            key=lambda item:
+                item["confidence"]
+        )
+
+        return (
+            "",
+            float(rejected_best["confidence"]),
+            False,
+            rejected_best["raw"]
+        )
+
     raw_text, confidence = max(
 
         (
@@ -2001,6 +2245,14 @@ def read_crop_text(
 
         final_text, mapped = (
             normalise_sign(
+                raw_text
+            )
+        )
+
+    elif class_name == "headers":
+
+        final_text, mapped = (
+            normalise_header(
                 raw_text
             )
         )
@@ -2069,6 +2321,404 @@ def sort_reading_order(
 
 
 # ============================================================
+# RESOLVE DUPLICATE ELEMENT SYMBOLS INSIDE EACH TABLE
+#
+# Example:
+# - two boxes initially read as Ti
+# - the higher-confidence Ti remains Ti
+# - the lower-confidence duplicate can use its next valid
+#   unused candidate, for example Tl
+# ============================================================
+
+def containing_table_key(
+    detection,
+    tables
+):
+
+    matching_tables = []
+
+    for table_index, table in enumerate(tables):
+
+        if (
+            table["x1"] <= detection["cx"] <= table["x2"]
+            and table["y1"] <= detection["cy"] <= table["y2"]
+        ):
+
+            table_area = max(
+                1,
+                (table["x2"] - table["x1"])
+                * (table["y2"] - table["y1"])
+            )
+
+            matching_tables.append({
+                "confidence": float(
+                    table.get("det_conf", 0.0)
+                ),
+                "area": table_area,
+                "index": table_index,
+            })
+
+    if not matching_tables:
+
+        # Symbols outside a detected table are treated as one
+        # page-level group rather than being discarded.
+        return "page"
+
+    # Prefer the most confident containing table. This avoids
+    # assigning two symbols to different nested duplicate table
+    # boxes merely because one table box is slightly smaller.
+    best_table = max(
+        matching_tables,
+        key=lambda item: (
+            item["confidence"],
+            item["area"]
+        )
+    )
+
+    return best_table["index"]
+
+
+def resolve_duplicate_element_symbols(
+    detections
+):
+
+    raw_tables = [
+        detection
+        for detection in detections
+        if detection["class_name"] == "table"
+    ]
+
+    # Collapse nested or near-duplicate detections of the same
+    # physical table. Keep the highest-confidence table box.
+    raw_tables.sort(
+        key=lambda detection:
+            detection.get("det_conf", 0.0),
+        reverse=True
+    )
+
+    tables = []
+
+    for table in raw_tables:
+
+        represents_existing_table = any(
+            smaller_box_overlap_ratio(
+                table,
+                existing_table
+            ) >= 0.60
+            for existing_table in tables
+        )
+
+        if not represents_existing_table:
+
+            tables.append(
+                table
+            )
+
+    symbols_by_table = {}
+
+    for detection in detections:
+
+        if (
+            detection["class_name"] != "element_symbol"
+            or not detection.get("text")
+        ):
+
+            continue
+
+        table_key = containing_table_key(
+            detection,
+            tables
+        )
+
+        symbols_by_table.setdefault(
+            table_key,
+            []
+        ).append(
+            detection
+        )
+
+    replacements = 0
+
+    for table_symbols in symbols_by_table.values():
+
+        used_symbols = {
+            detection["text"]
+            for detection in table_symbols
+            if detection.get("text")
+        }
+
+        symbols_by_text = {}
+
+        for detection in table_symbols:
+
+            symbols_by_text.setdefault(
+                detection["text"],
+                []
+            ).append(
+                detection
+            )
+
+        for duplicated_symbol, duplicates in (
+            symbols_by_text.items()
+        ):
+
+            if len(duplicates) <= 1:
+
+                continue
+
+            duplicates.sort(
+                key=lambda detection:
+                    detection.get("ocr_conf", 0.0),
+                reverse=True
+            )
+
+            # The strongest occurrence keeps the original
+            # symbol. Resolve each weaker duplicate in order.
+            for duplicate in duplicates[1:]:
+
+                replacement = None
+
+                preferred_fallbacks = (
+                    DUPLICATE_SYMBOL_FALLBACKS.get(
+                        duplicated_symbol,
+                        []
+                    )
+                )
+
+                # For a known visual pair such as Ti/Tl, prefer
+                # the configured counterpart when OCR supplied
+                # it as an alternative candidate.
+                for fallback_text in preferred_fallbacks:
+
+                    for alternative in duplicate.get(
+                        "ocr_alternatives",
+                        []
+                    ):
+
+                        if (
+                            alternative["text"] == fallback_text
+                            and fallback_text not in used_symbols
+                            and alternative["confidence"]
+                            > SYMBOL_MIN_CONFIDENCE
+                        ):
+
+                            replacement = alternative
+                            break
+
+                    if replacement is not None:
+
+                        break
+
+                if replacement is None:
+
+                    for alternative in duplicate.get(
+                        "ocr_alternatives",
+                        []
+                    ):
+
+                        alternative_text = alternative["text"]
+
+                        if (
+                            alternative_text != duplicated_symbol
+                            and alternative_text not in used_symbols
+                            and alternative["confidence"]
+                            > SYMBOL_MIN_CONFIDENCE
+                        ):
+
+                            replacement = alternative
+                            break
+
+                if replacement is None:
+
+                    # If OCR did not expose a separate candidate,
+                    # use a configured valid chemical-symbol
+                    # fallback for a known visual ambiguity.
+                    for fallback_text in preferred_fallbacks:
+
+                        if fallback_text in used_symbols:
+
+                            continue
+
+                        inferred_confidence = max(
+                            SYMBOL_MIN_CONFIDENCE + 0.001,
+                            float(
+                                duplicate.get(
+                                    "ocr_conf",
+                                    SYMBOL_MIN_CONFIDENCE + 0.001
+                                )
+                            ) * 0.85
+                        )
+
+                        replacement = {
+                            "text": fallback_text,
+                            "raw": duplicate.get(
+                                "raw_text",
+                                duplicated_symbol
+                            ),
+                            "confidence": inferred_confidence,
+                            "inferred": True,
+                        }
+
+                        break
+
+                if replacement is None:
+
+                    # Keep the duplicate visible, but flag it
+                    # because no safe distinct alternative was
+                    # found in the OCR candidate list.
+                    duplicate["warning"] = True
+                    duplicate["duplicate_symbol"] = True
+                    continue
+
+                duplicate["duplicate_resolved_from"] = (
+                    duplicate["text"]
+                )
+
+                duplicate["text"] = replacement["text"]
+                duplicate["raw_text"] = replacement["raw"]
+                duplicate["ocr_conf"] = replacement["confidence"]
+                duplicate["mapped"] = True
+                duplicate["inferred_symbol"] = replacement.get(
+                    "inferred",
+                    False
+                )
+                duplicate["warning"] = (
+                    replacement["confidence"]
+                    < OCR_MIN_CONFIDENCE
+                    or duplicate["inferred_symbol"]
+                )
+
+                used_symbols.add(
+                    replacement["text"]
+                )
+
+                replacements += 1
+
+    return replacements
+
+
+# ============================================================
+# NON-TABLE OVERLAP FILTER
+#
+# The table region is allowed to contain every other class.
+# For every other category, overlap greater than 5% of the
+# smaller box is treated as a conflict. The higher-confidence
+# detection is kept.
+# ============================================================
+
+def smaller_box_overlap_ratio(
+    first,
+    second
+):
+
+    intersection_x1 = max(
+        first["x1"],
+        second["x1"]
+    )
+
+    intersection_y1 = max(
+        first["y1"],
+        second["y1"]
+    )
+
+    intersection_x2 = min(
+        first["x2"],
+        second["x2"]
+    )
+
+    intersection_y2 = min(
+        first["y2"],
+        second["y2"]
+    )
+
+    intersection_width = max(
+        0,
+        intersection_x2 - intersection_x1
+    )
+
+    intersection_height = max(
+        0,
+        intersection_y2 - intersection_y1
+    )
+
+    intersection_area = (
+        intersection_width
+        * intersection_height
+    )
+
+    if intersection_area <= 0:
+
+        return 0.0
+
+    first_area = max(
+        1,
+        (first["x2"] - first["x1"])
+        * (first["y2"] - first["y1"])
+    )
+
+    second_area = max(
+        1,
+        (second["x2"] - second["x1"])
+        * (second["y2"] - second["y1"])
+    )
+
+    return (
+        intersection_area
+        / min(first_area, second_area)
+    )
+
+
+def filter_non_table_overlaps(
+    detections,
+    maximum_overlap=NON_TABLE_MAX_OVERLAP
+):
+
+    table_detections = [
+        detection
+        for detection in detections
+        if detection["class_name"] == "table"
+    ]
+
+    non_table_detections = [
+        detection
+        for detection in detections
+        if detection["class_name"] != "table"
+    ]
+
+    # Highest-confidence candidates are considered first.
+    non_table_detections.sort(
+        key=lambda detection:
+            detection["det_conf"],
+        reverse=True
+    )
+
+    kept = []
+
+    for candidate in non_table_detections:
+
+        conflicts = any(
+            smaller_box_overlap_ratio(
+                candidate,
+                existing
+            ) > maximum_overlap
+            for existing in kept
+        )
+
+        if not conflicts:
+
+            kept.append(
+                candidate
+            )
+
+    # Tables bypass the overlap filter and remain available
+    # even when they contain all of the kept token boxes.
+    return (
+        table_detections
+        + kept
+    )
+
+
+# ============================================================
 # OVERLAY LABEL
 # ============================================================
 
@@ -2079,6 +2729,43 @@ def make_overlay_label(
     class_name = detection[
         "class_name"
     ]
+
+    # In YOLO-only mode every detection is labelled by class,
+    # without a question mark or OCR placeholder.
+    if not detection.get(
+        "ocr_applied",
+        False
+    ):
+
+        short = CLASS_SHORT.get(
+            class_name,
+            "?"
+        )
+
+        if SHOW_CLASS_PREFIX:
+
+            return (
+                f"{short}: {class_name}"
+            )
+
+        return class_name
+
+    # The table class does not have OCR text.
+    # Headers reach the OCR-text section below.
+    if class_name in NO_OCR_CLASSES:
+
+        short = CLASS_SHORT.get(
+            class_name,
+            "?"
+        )
+
+        if SHOW_CLASS_PREFIX:
+
+            return (
+                f"{short}: {class_name}"
+            )
+
+        return class_name
 
     text = (
         detection.get(
@@ -2097,17 +2784,9 @@ def make_overlay_label(
             + "..."
         )
 
-    if SHOW_CLASS_PREFIX:
-
-        short = CLASS_SHORT.get(
-            class_name,
-            "?"
-        )
-
-        return (
-            f"{short}: {text}"
-        )
-
+    # YOLO + OCR mode shows only the recognised result.
+    # Examples: C, 0.25, %, MAX.
+    # Do not add E:, V:, U: or L: prefixes.
     return text
 
 
@@ -2285,7 +2964,8 @@ def rectangles_overlap(
 
 def draw_overlay(
     image,
-    detections
+    detections,
+    show_box_text=True
 ):
 
     output = image.copy()
@@ -2340,7 +3020,10 @@ def draw_overlay(
             OVERLAY_BOX_THICKNESS
         )
 
-        if not SHOW_OVERLAY_TEXT:
+        if (
+            not SHOW_OVERLAY_TEXT
+            or not show_box_text
+        ):
 
             continue
 
@@ -2595,7 +3278,7 @@ class OCRInspectionTool:
         self.image_item = None
 
         root.title(
-            "Chemical Document Quick Viewer + YOLO OCR"
+            "Chemical Document Viewer - YOLO / YOLO + OCR"
         )
 
         try:
@@ -2656,13 +3339,53 @@ class OCRInspectionTool:
             padx=2
         )
 
+        self.yolo_button = ttk.Button(
+
+            toolbar,
+
+            text="Run YOLO Only",
+
+            command=lambda:
+                self.start_inspection(
+                    use_ocr=False,
+                    show_box_text=True
+                )
+        )
+
+        self.yolo_button.pack(
+            side=tk.LEFT,
+            padx=2
+        )
+
+        self.colour_button = ttk.Button(
+
+            toolbar,
+
+            text="YOLO Colours Only",
+
+            command=lambda:
+                self.start_inspection(
+                    use_ocr=False,
+                    show_box_text=False
+                )
+        )
+
+        self.colour_button.pack(
+            side=tk.LEFT,
+            padx=2
+        )
+
         self.run_button = ttk.Button(
 
             toolbar,
 
             text="Run YOLO + OCR",
 
-            command=self.start_inspection
+            command=lambda:
+                self.start_inspection(
+                    use_ocr=True,
+                    show_box_text=True
+                )
         )
 
         self.run_button.pack(
@@ -2825,7 +3548,7 @@ class OCRInspectionTool:
 
             toolbar,
 
-            text="Hide OCR Overlay",
+            text="Hide Detection Overlay",
 
             command=self.toggle_overlay
         )
@@ -3032,7 +3755,7 @@ class OCRInspectionTool:
 
             result_frame,
 
-            text="YOLO / OCR detections",
+            text="YOLO detections and OCR results",
 
             font=(
                 "Segoe UI",
@@ -3048,6 +3771,114 @@ class OCRInspectionTool:
                 2,
                 5
             )
+        )
+
+        # ====================================================
+        # YOLO BOX COLOUR LEGEND
+        # ====================================================
+
+        legend_frame = ttk.LabelFrame(
+            result_frame,
+            text="YOLO box colours",
+            padding=5
+        )
+
+        legend_frame.pack(
+            fill=tk.X,
+            pady=(0, 7)
+        )
+
+        self.colour_legend = tk.Text(
+            legend_frame,
+            height=6,
+            wrap=tk.NONE,
+            relief=tk.FLAT,
+            borderwidth=0,
+            background="#f7f7f7",
+            cursor="arrow",
+            font=("Segoe UI", 9)
+        )
+
+        self.colour_legend.pack(
+            fill=tk.X
+        )
+
+        legend_descriptions = {
+            "element_symbol": "Element symbol",
+            "element_value": "Element value",
+            "unit": "Unit",
+            "limit_indicator": "Limit indicator",
+            "table": "Complete table region",
+            "headers": "Header region",
+        }
+
+        for class_id, class_name in EXPECTED_CLASSES.items():
+
+            colour = CLASS_COLOURS.get(
+                class_name,
+                (80, 80, 80)
+            )
+
+            tag_name = f"legend_{class_name}"
+
+            self.colour_legend.tag_configure(
+                tag_name,
+                foreground=rgb_to_hex(colour),
+                font=("Segoe UI", 9, "bold")
+            )
+
+            description = legend_descriptions.get(
+                class_name,
+                class_name
+            )
+
+            self.colour_legend.insert(
+                tk.END,
+                f"■  {class_id}  {description}\n",
+                tag_name
+            )
+
+        self.colour_legend.config(
+            state=tk.DISABLED
+        )
+
+        # ====================================================
+        # PROCESSING TIME INFORMATION
+        # ====================================================
+
+        timing_frame = ttk.LabelFrame(
+            result_frame,
+            text="Processing time",
+            padding=5
+        )
+
+        timing_frame.pack(
+            fill=tk.X,
+            pady=(0, 7)
+        )
+
+        self.timing_text = tk.Text(
+            timing_frame,
+            height=12,
+            wrap=tk.NONE,
+            relief=tk.FLAT,
+            borderwidth=0,
+            background="#f7f7f7",
+            cursor="arrow",
+            font=("Consolas", 8)
+        )
+
+        self.timing_text.pack(
+            fill=tk.X
+        )
+
+        self.timing_text.insert(
+            tk.END,
+            "Run YOLO or YOLO + OCR to display timing."
+        )
+
+        self.timing_text.config(
+            state=tk.DISABLED
         )
 
         columns = (
@@ -3247,6 +4078,87 @@ class OCRInspectionTool:
         )
 
         self._set_navigation_state()
+
+
+    # ========================================================
+    # UPDATE PROCESSING TIME PANEL
+    # ========================================================
+
+    def update_timing_display(
+        self,
+        timing_info
+    ):
+
+        lines = [
+            f"YOLO:       {format_duration(timing_info['yolo_seconds'])}",
+            f"Whole OCR:  {format_duration(timing_info['ocr_total_seconds'])}",
+            f"OCR work:   {format_duration(timing_info['ocr_recognition_seconds'])}",
+            f"OCR load:   {format_duration(timing_info['ocr_load_seconds'])}",
+            f"Total:      {format_duration(timing_info['total_seconds'])}",
+            "",
+            "OCR average by category:",
+        ]
+
+        category_times = timing_info.get(
+            "ocr_category_times",
+            {}
+        )
+
+        category_order = [
+            class_name
+            for class_name in EXPECTED_CLASSES.values()
+            if class_name in OCR_CLASSES
+        ]
+
+        category_found = False
+
+        for class_name in category_order:
+
+            category = category_times.get(
+                class_name
+            )
+
+            if not category or category["count"] == 0:
+
+                continue
+
+            category_found = True
+
+            average_seconds = (
+                category["total_seconds"]
+                / category["count"]
+            )
+
+            lines.append(
+                f"{class_name:16s} "
+                f"n={category['count']:3d}  "
+                f"total={format_duration(category['total_seconds'])}  "
+                f"avg={format_duration(average_seconds)}"
+            )
+
+        if not category_found:
+
+            lines.append(
+                "No OCR categories processed."
+            )
+
+        self.timing_text.config(
+            state=tk.NORMAL
+        )
+
+        self.timing_text.delete(
+            "1.0",
+            tk.END
+        )
+
+        self.timing_text.insert(
+            tk.END,
+            "\n".join(lines)
+        )
+
+        self.timing_text.config(
+            state=tk.DISABLED
+        )
 
 
     # ========================================================
@@ -3532,13 +4444,13 @@ class OCRInspectionTool:
         if SHOW_OVERLAY:
 
             self.overlay_button.config(
-                text="Hide OCR Overlay"
+                text="Hide Detection Overlay"
             )
 
         else:
 
             self.overlay_button.config(
-                text="Show OCR Overlay"
+                text="Show Detection Overlay"
             )
 
         image = (
@@ -3557,7 +4469,11 @@ class OCRInspectionTool:
     # START YOLO + OCR
     # ========================================================
 
-    def start_inspection(self):
+    def start_inspection(
+        self,
+        use_ocr,
+        show_box_text=True
+    ):
 
         if self.current_image is None:
 
@@ -3584,10 +4500,30 @@ class OCRInspectionTool:
             state=tk.DISABLED
         )
 
+        self.yolo_button.config(
+            state=tk.DISABLED
+        )
+
+        self.colour_button.config(
+            state=tk.DISABLED
+        )
+
         self._set_navigation_state()
 
+        if use_ocr:
+
+            mode_text = "YOLO + OCR"
+
+        elif show_box_text:
+
+            mode_text = "YOLO only"
+
+        else:
+
+            mode_text = "YOLO colours only"
+
         self.set_status(
-            "Running YOLO..."
+            f"Running {mode_text}..."
         )
 
         image = (
@@ -3598,7 +4534,11 @@ class OCRInspectionTool:
 
             target=self._process_image,
 
-            args=(image,),
+            args=(
+                image,
+                use_ocr,
+                show_box_text
+            ),
 
             daemon=True
 
@@ -3611,10 +4551,16 @@ class OCRInspectionTool:
 
     def _process_image(
         self,
-        image
+        image,
+        use_ocr,
+        show_box_text
     ):
 
         try:
+
+            processing_started = time.perf_counter()
+
+            yolo_started = time.perf_counter()
 
             result = self.model.predict(
 
@@ -3630,9 +4576,28 @@ class OCRInspectionTool:
 
                 device=DEVICE,
 
+                # Keep YOLO NMS class-aware so the table
+                # detection cannot suppress contained classes.
+                agnostic_nms=False,
+
                 verbose=False
 
             )[0]
+
+            yolo_seconds = (
+                time.perf_counter()
+                - yolo_started
+            )
+
+            ocr_load_seconds = 0.0
+
+            ocr_category_times = {
+                class_name: {
+                    "count": 0,
+                    "total_seconds": 0.0,
+                }
+                for class_name in OCR_CLASSES
+            }
 
             detections = []
 
@@ -3728,6 +4693,19 @@ class OCRInspectionTool:
                             ) / 2.0,
                     })
 
+            detections_before_filter = len(
+                detections
+            )
+
+            detections = filter_non_table_overlaps(
+                detections
+            )
+
+            removed_overlaps = (
+                detections_before_filter
+                - len(detections)
+            )
+
             detections = (
                 sort_reading_order(
                     detections
@@ -3738,9 +4716,54 @@ class OCRInspectionTool:
                 detections
             )
 
+            ocr_detections = [
+
+                detection
+
+                for detection
+                in detections
+
+                if (
+                    use_ocr
+                    and detection["class_name"]
+                    in OCR_CLASSES
+                )
+            ]
+
+            ocr_total = len(
+                ocr_detections
+            )
+
+            # Load EasyOCR only when the user selects the
+            # YOLO + OCR button. YOLO-only inspection starts
+            # without paying the OCR loading cost.
+            if (
+                use_ocr
+                and ocr_total > 0
+                and self.reader is None
+            ):
+
+                self.root.after(
+                    0,
+                    self.set_status,
+                    "Loading EasyOCR..."
+                )
+
+                ocr_load_started = time.perf_counter()
+
+                self.reader = easyocr.Reader(
+                    ["en"],
+                    gpu=torch.cuda.is_available()
+                )
+
+                ocr_load_seconds = (
+                    time.perf_counter()
+                    - ocr_load_started
+                )
+
             for index, detection in enumerate(
 
-                detections,
+                ocr_detections,
 
                 start=1
             ):
@@ -3748,7 +4771,7 @@ class OCRInspectionTool:
                 if (
                     index == 1
                     or index % 10 == 0
-                    or index == total
+                    or index == ocr_total
                 ):
 
                     self.root.after(
@@ -3760,8 +4783,10 @@ class OCRInspectionTool:
                         f"OCR "
                         f"{index}"
                         f" / "
-                        f"{total}"
+                        f"{ocr_total}"
                     )
+
+                ocr_item_started = time.perf_counter()
 
                 (
                     final_text,
@@ -3776,6 +4801,24 @@ class OCRInspectionTool:
                     image,
 
                     detection
+                )
+
+                ocr_item_seconds = (
+                    time.perf_counter()
+                    - ocr_item_started
+                )
+
+                detection["ocr_duration_seconds"] = (
+                    ocr_item_seconds
+                )
+
+                category_timing = ocr_category_times[
+                    detection["class_name"]
+                ]
+
+                category_timing["count"] += 1
+                category_timing["total_seconds"] += (
+                    ocr_item_seconds
                 )
 
                 detection[
@@ -3795,6 +4838,10 @@ class OCRInspectionTool:
                 ] = mapped
 
                 detection[
+                    "ocr_applied"
+                ] = True
+
+                detection[
                     "warning"
                 ] = (
 
@@ -3808,12 +4855,74 @@ class OCRInspectionTool:
                     not mapped
                 )
 
+            duplicate_symbol_replacements = 0
+
+            if use_ocr:
+
+                duplicate_symbol_replacements = (
+                    resolve_duplicate_element_symbols(
+                        detections
+                    )
+                )
+
+            # In YOLO-only mode no class is passed to OCR.
+            # In YOLO + OCR mode, only the complete table region
+            # bypasses OCR. Header regions are now read by OCR.
+            for detection in detections:
+
+                if (
+                    not use_ocr
+                    or detection["class_name"]
+                    in NO_OCR_CLASSES
+                ):
+
+                    detection["text"] = ""
+                    detection["raw_text"] = ""
+                    detection["ocr_conf"] = None
+                    detection["mapped"] = True
+                    detection["warning"] = False
+                    detection["ocr_applied"] = False
+
+                detection["removed_overlaps"] = (
+                    removed_overlaps
+                )
+
+                detection["duplicate_symbol_replacements"] = (
+                    duplicate_symbol_replacements
+                )
+
             overlay = draw_overlay(
 
                 image,
 
-                detections
+                detections,
+
+                show_box_text=show_box_text
             )
+
+            ocr_recognition_seconds = sum(
+                category["total_seconds"]
+                for category in ocr_category_times.values()
+            )
+
+            ocr_total_seconds = (
+                ocr_load_seconds
+                + ocr_recognition_seconds
+            )
+
+            total_seconds = (
+                time.perf_counter()
+                - processing_started
+            )
+
+            timing_info = {
+                "yolo_seconds": yolo_seconds,
+                "ocr_recognition_seconds": ocr_recognition_seconds,
+                "ocr_load_seconds": ocr_load_seconds,
+                "ocr_total_seconds": ocr_total_seconds,
+                "total_seconds": total_seconds,
+                "ocr_category_times": ocr_category_times,
+            }
 
             self.root.after(
 
@@ -3823,7 +4932,13 @@ class OCRInspectionTool:
 
                 detections,
 
-                overlay
+                overlay,
+
+                use_ocr,
+
+                show_box_text,
+
+                timing_info
             )
 
         except Exception as error:
@@ -3847,7 +4962,10 @@ class OCRInspectionTool:
     def _inspection_complete(
         self,
         detections,
-        overlay
+        overlay,
+        use_ocr,
+        show_box_text,
+        timing_info
     ):
 
         self.detections = (
@@ -3856,6 +4974,10 @@ class OCRInspectionTool:
 
         self.annotated_image = (
             overlay
+        )
+
+        self.update_timing_display(
+            timing_info
         )
 
         self.clear_table()
@@ -3867,12 +4989,42 @@ class OCRInspectionTool:
             start=1
         ):
 
+            is_structural = (
+                detection["class_name"]
+                in STRUCTURAL_CLASSES
+            )
+
+            ocr_applied = detection.get(
+                "ocr_applied",
+                False
+            )
+
             warning = (
                 "⚠"
                 if detection[
                     "warning"
                 ]
                 else ""
+            )
+
+            raw_display = (
+                "—"
+                if not ocr_applied
+                else detection.get("raw_text", "")
+            )
+
+            final_display = (
+                detection.get("text", "")
+                if ocr_applied
+                else "YOLO region"
+                if is_structural
+                else "YOLO box"
+            )
+
+            ocr_display = (
+                "—"
+                if not ocr_applied
+                else f'{detection.get("ocr_conf", 0):.0%}'
             )
 
             self.table.insert(
@@ -3893,19 +5045,13 @@ class OCRInspectionTool:
                         "class_name"
                     ],
 
-                    detection.get(
-                        "raw_text",
-                        ""
-                    ),
+                    raw_display,
 
-                    detection.get(
-                        "text",
-                        ""
-                    ),
+                    final_display,
 
                     f'{detection["det_conf"]:.0%}',
 
-                    f'{detection.get("ocr_conf", 0):.0%}',
+                    ocr_display,
 
                     warning
                 )
@@ -3923,6 +5069,14 @@ class OCRInspectionTool:
             state=tk.NORMAL
         )
 
+        self.yolo_button.config(
+            state=tk.NORMAL
+        )
+
+        self.colour_button.config(
+            state=tk.NORMAL
+        )
+
         self._set_navigation_state()
 
         warnings = sum(
@@ -3933,6 +5087,9 @@ class OCRInspectionTool:
 
             for d
             in detections
+
+            if d["class_name"]
+            in OCR_CLASSES
         )
 
         recognised = sum(
@@ -3945,14 +5102,76 @@ class OCRInspectionTool:
 
             for d
             in detections
+
+            if d["class_name"]
+            in OCR_CLASSES
         )
 
+        ocr_total = sum(
+
+            d["class_name"] in OCR_CLASSES
+
+            for d
+            in detections
+        )
+
+        structural_total = sum(
+
+            d["class_name"] in STRUCTURAL_CLASSES
+
+            for d
+            in detections
+        )
+
+        removed_overlaps = (
+            detections[0].get(
+                "removed_overlaps",
+                0
+            )
+            if detections
+            else 0
+        )
+
+        duplicate_symbol_replacements = (
+            detections[0].get(
+                "duplicate_symbol_replacements",
+                0
+            )
+            if detections
+            else 0
+        )
+
+        if use_ocr:
+
+            status_text = (
+                f"{len(detections)} boxes | "
+                f"{recognised}/{ocr_total} OCR | "
+                f"{structural_total} regions | "
+                f"{warnings} warnings | "
+                f"{duplicate_symbol_replacements} symbols corrected | "
+                f"{removed_overlaps} overlaps removed"
+            )
+
+        elif show_box_text:
+
+            status_text = (
+                f"YOLO only | "
+                f"{len(detections)} boxes | "
+                f"{structural_total} regions | "
+                f"{removed_overlaps} overlaps removed"
+            )
+
+        else:
+
+            status_text = (
+                f"YOLO colours only | "
+                f"{len(detections)} boxes | "
+                f"{structural_total} regions | "
+                f"{removed_overlaps} overlaps removed"
+            )
+
         self.set_status(
-
-            f"{len(detections)} boxes | "
-            f"{recognised} OCR | "
-            f"{warnings} warnings",
-
+            status_text,
             "#137333"
         )
 
@@ -3973,6 +5192,14 @@ class OCRInspectionTool:
         )
 
         self.run_button.config(
+            state=tk.NORMAL
+        )
+
+        self.yolo_button.config(
+            state=tk.NORMAL
+        )
+
+        self.colour_button.config(
             state=tk.NORMAL
         )
 
@@ -4784,36 +6011,17 @@ def main():
     print("=" * 70)
 
     print(
-        "LOADING EASYOCR"
+        "OCR LOADING MODE"
     )
 
     print("=" * 70)
 
-    gpu_available = (
-        torch.cuda.is_available()
-    )
-
     print(
-        "CUDA available:",
-        gpu_available
+        "EasyOCR will load only when "
+        "Run YOLO + OCR is selected."
     )
 
-    print(
-        "EasyOCR GPU    :",
-        gpu_available
-    )
-
-    reader = easyocr.Reader(
-
-        ["en"],
-
-        gpu=gpu_available
-    )
-
-    print()
-    print(
-        "EasyOCR loaded successfully."
-    )
+    reader = None
 
     root = tk.Tk()
 
