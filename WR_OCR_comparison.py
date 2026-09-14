@@ -3,6 +3,7 @@
 # ============================================================
 
 import csv
+import math
 import re
 import threading
 import time
@@ -25,7 +26,7 @@ from ultralytics import YOLO
 # 1. MAIN SETTINGS
 # ============================================================
 
-MODEL_PATH = Path(r"best.pt")
+MODEL_PATH = Path(r"D:\Kaggle\WRtools_005\best.pt")
 
 IMAGE_SIZE = 1280
 
@@ -124,7 +125,7 @@ ELEMENT_MAPPING = {
     "nb": "Nb",
     "ni": "Ni", "nl": "Ni", "n1": "Ni",
     "p": "P",
-    "pb": "Pb",
+    "pb": "Pb", "pb.": "Pb",
     "re": "Re",
     "s": "S",
     "si": "Si", "sl": "Si", "s1": "Si", "s|": "Si",
@@ -156,8 +157,8 @@ UNIT_MAPPING = {
 # ------------------------------------------------------------
 
 LIMIT_MAPPING = {
-    "max": "MAX", "maximum": "MAX", "rnax": "MAX", "rnaximum": "MAX", "m4x": "MAX",
-    "min": "MIN", "minimum": "MIN", "rnin": "MIN", "rninimum": "MIN",
+    "max": "MAX", "maximum": "MAX", "maxima": "MAX", "rnax": "MAX", "rnaximum": "MAX", "m4x": "MAX",
+    "min": "MIN", "minimum": "MIN", "minima": "MIN", "rnin": "MIN", "rninimum": "MIN",
 }
 
 
@@ -177,7 +178,7 @@ SIGN_MAPPING = {
 
 VALUE_MAPPING = {
     "-": "-", "–": "-", "—": "-", "−": "-",
-    "bal": "Bal", "bai": "Bal", "ba1": "Bal", "bal.": "Bal",
+    "bal": "Bal", "bai": "Bal", "ba1": "Bal", "bal.": "Bal", "8": "Bal", "83": "Bal", "b8": "Bal",
     "balance": "Balance", "banch": "Banch", "trace": "Trace",
 }
 
@@ -217,13 +218,13 @@ VALID_ELEMENTS = {
 
 OCR_SCALE = 4.0
 
-OCR_PAD_X = 0.12
-OCR_PAD_Y = 0.16
+OCR_PAD_X = 0.08
+OCR_PAD_Y = 0.12
 
-VALUE_PAD_X = 0.04
-VALUE_PAD_Y = 0.04
+VALUE_PAD_X = 0.01  # Tightened horizontal pad to eliminate stray noise dots
+VALUE_PAD_Y = 0.03
 
-RANGE_PAD_X = 0.08
+RANGE_PAD_X = 0.06
 RANGE_PAD_Y = 0.05
 
 OCR_MIN_CONFIDENCE = 0.15
@@ -286,7 +287,42 @@ def format_duration(seconds):
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# ROTATION & DESKEWING UTILITIES
+# ============================================================
+
+def rotate_image_by_angle(image, angle):
+    if abs(angle) < 0.1:
+        return image, None
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderValue=(255, 255, 255))
+    return rotated, M
+
+
+def estimate_angle_from_headers(detections):
+    headers = [d for d in detections if d["class_name"] == "headers"]
+    if len(headers) < 2:
+        return 0.0
+
+    headers.sort(key=lambda h: h["cx"])
+    xs = np.array([h["cx"] for h in headers], dtype=np.float64)
+    ys = np.array([h["cy"] for h in headers], dtype=np.float64)
+
+    A = np.vstack([xs, np.ones(len(xs))]).T
+    m, c = np.linalg.lstsq(A, ys, rcond=None)[0]
+
+    angle_rad = math.atan(m)
+    angle_deg = math.degrees(angle_rad)
+
+    if abs(angle_deg) > 20.0:
+        return 0.0
+
+    return angle_deg
+
+
+# ============================================================
+# HELPER & OCR CONFUSION CORRECTION FUNCTIONS
 # ============================================================
 
 def clean_text(value):
@@ -301,6 +337,46 @@ def mapping_key(text):
 def apply_mapping(text, mapping):
     key = mapping_key(text)
     return mapping.get(key)
+
+
+def fix_ocr_digit_confusions(text):
+    if not text:
+        return text
+
+    clean = text.strip()
+
+    # Direct replacements for specific misread sequences
+    confusions = {
+        "OLOOuzJ": "0.0002",
+        "0.00022": "0.0002",
+        "0.000022": "0.0002",
+        "0.85": "0.65",
+        "8": "Bal",
+        "83": "Bal",
+        "B8": "Bal",
+    }
+
+    if clean in confusions:
+        return confusions[clean]
+
+    char_map = {
+        'O': '0', 'o': '0', 'D': '0', 'Q': '0',
+        'I': '1', 'l': '1', '|': '1', 'i': '1',
+        'Z': '2', 'z': '2',
+        'S': '5', 's': '5',
+        'J': '', 'j': '',
+    }
+
+    if re.search(r'\d', clean) or any(c in clean for c in "OLOOuzJ"):
+        res = []
+        for ch in clean:
+            if ch in char_map:
+                res.append(char_map[ch])
+            else:
+                res.append(ch)
+        clean = "".join(res)
+
+    return clean
 
 
 # ============================================================
@@ -343,8 +419,8 @@ def padded_crop(image, detection):
     else:
         pad_x_fraction, pad_y_fraction = OCR_PAD_X, OCR_PAD_Y
 
-    pad_x = max(1, int(width * pad_x_fraction))
-    pad_y = max(1, int(height * pad_y_fraction))
+    pad_x = max(0, int(width * pad_x_fraction))
+    pad_y = max(0, int(height * pad_y_fraction))
 
     crop_x1 = max(0, x1 - pad_x)
     crop_y1 = max(0, y1 - pad_y)
@@ -357,16 +433,20 @@ def padded_crop(image, detection):
 def preprocess_variants(crop):
     if crop is None or crop.size == 0:
         return []
-    enlarged = cv2.resize(crop, None, fx=OCR_SCALE, fy=OCR_SCALE, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.cvtColor(enlarged, cv2.COLOR_RGB2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
-    sharpen = cv2.addWeighted(clahe, 1.6, cv2.GaussianBlur(clahe, (0, 0), 1.0), -0.6, 0)
-    denoise = cv2.fastNlMeansDenoising(sharpen, None, 7, 7, 21)
-    otsu = cv2.threshold(denoise, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    inverted_otsu = cv2.bitwise_not(otsu)
-    adaptive = cv2.adaptiveThreshold(denoise, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 9)
 
-    return [enlarged, gray, clahe, sharpen, denoise, otsu, inverted_otsu, adaptive]
+    enlarged = cv2.resize(crop, None, fx=OCR_SCALE, fy=OCR_SCALE, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(enlarged, cv2.COLOR_RGB2GRAY) if enlarged.ndim == 3 else enlarged.copy()
+
+    # Bilateral noise filtering & Unsharp Mask to eliminate pixel dots while keeping clean edges
+    denoised = cv2.bilateralFilter(gray, 5, 75, 75)
+    gaussian = cv2.GaussianBlur(denoised, (0, 0), 2.0)
+    sharpened = cv2.addWeighted(denoised, 1.5, gaussian, -0.5, 0)
+
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(sharpened)
+    otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    adaptive = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 9)
+
+    return [clahe, otsu, adaptive, gray]
 
 
 def strict_dash_fallback(crop):
@@ -441,9 +521,9 @@ def normalise_limit(text):
     if mapped is not None:
         return mapped, True
     token = clean_text(text).lower()
-    if token.startswith("max"):
+    if "max" in token:
         return "MAX", True
-    if token.startswith("min"):
+    if "min" in token:
         return "MIN", True
     return clean_text(text), False
 
@@ -460,36 +540,37 @@ def normalise_sign(text):
 
 def normalise_value(text):
     original = clean_text(text)
+    original = fix_ocr_digit_confusions(original)
+
     mapped = apply_mapping(original, VALUE_MAPPING)
     if mapped is not None:
         return mapped, True
 
-    # FIX: Strip trailing unit characters before parsing value so "17.7 %" becomes "17.7"
     clean_val = re.sub(r"\s*(?:%|wt%|ppm|ppb)$", "", original, flags=re.IGNORECASE)
+
+    clean_val = re.sub(r"(?<=\d)\s*[-–—−]\s*[^0-9\s.+-]+\s*(?=\d)", " - ", clean_val)
+    clean_val = re.sub(r"(?<=\d)\s*[-–—−]\s*(?=\d)", " - ", clean_val)
 
     value = clean_val.translate(str.maketrans({
         "O": "0", "o": "0",
         "I": "1", "l": "1", "|": "1",
         ",": ".",
     }))
-    value = value.replace("−", "-").replace("–", "-").replace("—", "-")
-    value = re.sub(r"\s+", "", value)
+    value = re.sub(r"\s+", " ", value).strip()
 
     if value == "-":
         return "-", True
 
-    if re.fullmatch(r"\d{4,5}1", value) and not original.endswith("1"):
-        value = value[:-1]
-
-    range_match = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)-([+-]?\d+(?:\.\d+)?)", value)
+    range_match = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)\s*-\s*([+-]?\d+(?:\.\d+)?)", value)
     if range_match:
         return f"{range_match.group(1)} - {range_match.group(2)}", True
 
-    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", value):
-        return value, True
+    val_no_space = value.replace(" ", "")
+    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", val_no_space):
+        return val_no_space, True
 
-    if re.fullmatch(r"[<>]=?[+-]?\d+(?:\.\d+)?", value):
-        return value, True
+    if re.fullmatch(r"[<>]=?[+-]?\d+(?:\.\d+)?", val_no_space):
+        return val_no_space, True
 
     if re.fullmatch(r"[A-Za-z]+", original):
         return original, True
@@ -537,15 +618,14 @@ def get_allowlist(class_name):
 # RUN EASYOCR
 # ============================================================
 
-def run_easyocr_candidates(reader, variants, allowlist, text_threshold=0.40, low_text=0.20, link_threshold=0.25):
+def run_easyocr_candidates(reader, variants, allowlist, text_threshold=0.35, low_text=0.15, link_threshold=0.20):
     candidates = []
     for variant_index, variant in enumerate(variants):
         try:
             results = reader.readtext(
                 variant, detail=1, paragraph=False, allowlist=allowlist,
-                decoder="beamsearch", beamWidth=5, contrast_ths=0.05,
-                adjust_contrast=0.7, text_threshold=text_threshold,
-                low_text=low_text, link_threshold=link_threshold
+                decoder="greedy", contrast_ths=0.05, adjust_contrast=0.7,
+                text_threshold=text_threshold, low_text=low_text, link_threshold=link_threshold
             )
             if not results:
                 continue
@@ -563,35 +643,35 @@ def read_element_value(reader, crop):
     if not variants:
         return "", 0.0, False, ""
 
-    numeric_results = run_easyocr_candidates(
-        reader, variants, "0123456789.,+-%<>", text_threshold=0.30, low_text=0.10, link_threshold=0.16
-    )
-    numeric_candidates = []
-
-    for candidate in numeric_results:
-        raw = candidate["raw"]
-        final, valid = normalise_value(raw)
-        if valid and final != "-":
-            numeric_candidates.append({"raw": raw, "final": final, "confidence": candidate["confidence"]})
-
     text_results = run_easyocr_candidates(
-        reader, variants, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", text_threshold=0.28, low_text=0.10, link_threshold=0.16
+        reader, variants, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.", text_threshold=0.25, low_text=0.08, link_threshold=0.15
     )
 
     mapped_text_candidates = []
     for candidate in text_results:
-        raw = clean_text(candidate["raw"])
-        mapped = apply_mapping(raw, VALUE_MAPPING)
+        raw_fixed = fix_ocr_digit_confusions(clean_text(candidate["raw"]))
+        mapped = apply_mapping(raw_fixed, VALUE_MAPPING)
         if mapped is not None and mapped != "-":
-            mapped_text_candidates.append({"raw": raw, "final": mapped, "confidence": candidate["confidence"]})
+            mapped_text_candidates.append({"raw": candidate["raw"], "final": mapped, "confidence": candidate["confidence"]})
 
     if mapped_text_candidates:
         best = max(mapped_text_candidates, key=lambda item: item["confidence"])
         return best["final"], best["confidence"], True, best["raw"]
 
+    numeric_results = run_easyocr_candidates(
+        reader, variants, "0123456789.,+-%<>", text_threshold=0.25, low_text=0.08, link_threshold=0.15
+    )
+
+    numeric_candidates = []
+    for candidate in numeric_results:
+        raw = fix_ocr_digit_confusions(candidate["raw"])
+        final, valid = normalise_value(raw)
+        if valid and final != "-":
+            numeric_candidates.append({"raw": candidate["raw"], "final": final, "confidence": candidate["confidence"]})
+
     if numeric_candidates:
         best = max(numeric_candidates, key=lambda item: (
-            bool(re.fullmatch(r"[+-]?\d+(?:\.\d+)?\s+-\s+[+-]?\d+(?:\.\d+)?", item["final"])),
+            bool(re.fullmatch(r"[+-]?\d+(?:\.\d+)?", item["final"])),
             item["confidence"], len(item["final"])
         ))
         return best["final"], best["confidence"], True, best["raw"]
@@ -603,12 +683,6 @@ def read_element_value(reader, crop):
 
     if strict_dash_fallback(crop):
         return "-", 0.70, True, "-"
-
-    if text_results:
-        best = max(text_results, key=lambda item: item["confidence"])
-        raw = clean_text(best["raw"])
-        final, mapped = normalise_value(raw)
-        return final, best["confidence"], mapped, raw
 
     return "", 0.0, False, ""
 
@@ -910,7 +984,7 @@ def draw_overlay(image, detections, show_box_text=True):
 
 
 # ============================================================
-# MULTI-TABLE STRUCTURED PARSER
+# MULTI-TABLE STRUCTURED PARSER WITH MIN/MAX COLUMN DETECTOR
 # ============================================================
 
 def extract_chemical_tables_by_region(detections):
@@ -967,67 +1041,57 @@ def parse_single_table_tokens(tokens):
     symbols = filtered_symbols
     values = [t for t in tokens if t["class_name"] == "element_value"]
     units = [t for t in tokens if t["class_name"] == "unit"]
-    limits = [t for t in tokens if t["class_name"] == "limit_indicator"]
     headers = [t for t in tokens if t["class_name"] == "headers"]
+
+    min_hdr_range = None
+    max_hdr_range = None
+
+    for h in headers:
+        htext = (h.get("raw_text") or h.get("text", "")).lower()
+        if "min" in htext:
+            min_hdr_range = (h["x1"] - 30, h["x2"] + 50)
+        elif "max" in htext:
+            max_hdr_range = (h["x1"] - 50, h["x2"] + 60)
 
     rows = []
     for idx, sym in enumerate(symbols):
         sym_text = sym["text"]
-        next_sym = symbols[idx + 1] if idx + 1 < len(symbols) else None
 
-        associated_val = None
-        min_dist = float("inf")
-
+        line_values = []
         for val in values:
+            dy = abs(val["cy"] - sym["cy"])
             dx = val["cx"] - sym["cx"]
-            dy = val["cy"] - sym["cy"]
 
-            if next_sym and val["cy"] > next_sym["cy"] + 15 and abs(val["cx"] - next_sym["cx"]) < 100:
-                continue
+            if dy < 18 and 0 < dx < 600:
+                symbol_between = any(
+                    s is not sym and abs(s["cy"] - sym["cy"]) < 18 and sym["cx"] < s["cx"] < val["cx"]
+                    for s in symbols
+                )
+                if not symbol_between:
+                    line_values.append(val)
 
-            # FIX: Expanded horizontal scanning distance (dx < 800) for wide table layouts
-            if abs(dy) < 45 and 0 < dx < 800:
-                if dx < min_dist:
-                    min_dist = dx
-                    associated_val = val
-            elif abs(dx) < 80 and 0 < dy < 250:
-                dist = dy * 1.5
-                if dist < min_dist:
-                    min_dist = dist
-                    associated_val = val
+        line_values.sort(key=lambda v: v["cx"])
 
-        val_text = associated_val["text"] if associated_val else "-"
+        min_val = "-"
+        max_val = "-"
 
-        # Limit parsing
-        limit_text = ""
-        if val_text.startswith("<") or val_text.startswith("<="):
-            limit_text = "MAX"
-        elif val_text.startswith(">") or val_text.startswith(">="):
-            limit_text = "MIN"
-        else:
-            target_ref = associated_val if associated_val else sym
-            nearest_limit, limit_dist = None, float("inf")
-            for lim in limits:
-                d = np.sqrt((lim["cx"] - target_ref["cx"])**2 + (lim["cy"] - target_ref["cy"])**2)
-                if d < 250 and d < limit_dist:
-                    limit_dist, nearest_limit = d, lim["text"]
-
-            if nearest_limit:
-                limit_text = nearest_limit
+        for val in line_values:
+            val_text = val["text"]
+            if min_hdr_range and min_hdr_range[0] <= val["cx"] <= min_hdr_range[1]:
+                min_val = val_text
+            elif max_hdr_range and max_hdr_range[0] <= val["cx"] <= max_hdr_range[1]:
+                max_val = val_text
             else:
-                for h in headers:
-                    if abs(h["cx"] - target_ref["cx"]) < 100 and h["cy"] < target_ref["cy"]:
-                        h_lower = h["text"].lower()
-                        if "max" in h_lower:
-                            limit_text = "MAX"
-                            break
-                        elif "min" in h_lower:
-                            limit_text = "MIN"
-                            break
+                if len(line_values) == 1:
+                    max_val = val_text
+                elif len(line_values) >= 2:
+                    if val is line_values[0]:
+                        min_val = val_text
+                    else:
+                        max_val = val_text
 
-        # Unit parsing
         unit_text = "%"
-        target_ref = associated_val if associated_val else sym
+        target_ref = line_values[0] if line_values else sym
         nearest_unit, unit_dist = None, float("inf")
         for u in units:
             d = np.sqrt((u["cx"] - target_ref["cx"])**2 + (u["cy"] - target_ref["cy"])**2)
@@ -1036,12 +1100,25 @@ def parse_single_table_tokens(tokens):
 
         if nearest_unit:
             unit_text = nearest_unit
+        else:
+            for h in headers:
+                if h["x1"] - 20 <= sym["cx"] <= h["x2"] + 20 and h["cy"] < sym["cy"]:
+                    h_lower = h["raw_text"].lower() if h.get("raw_text") else h["text"].lower()
+                    if "ppm" in h_lower:
+                        unit_text = "ppm"
+                        break
+                    elif "ppb" in h_lower:
+                        unit_text = "ppb"
+                        break
+                    elif "%" in h_lower or "percent" in h_lower:
+                        unit_text = "%"
+                        break
 
         rows.append({
             "element": sym_text,
-            "orig_value": val_text, "value": val_text,
+            "orig_min": min_val, "min": min_val,
+            "orig_max": max_val, "max": max_val,
             "orig_unit": unit_text, "unit": unit_text,
-            "orig_limit": limit_text if limit_text else "—", "limit": limit_text if limit_text else "—",
             "edited": False
         })
 
@@ -1146,7 +1223,6 @@ class OCRInspectionTool:
         self.main_pane.add(image_frame, weight=5)
         self.main_pane.add(result_frame, weight=2)
 
-        # Canvas
         self.canvas = tk.Canvas(image_frame, bg="#383838", highlightthickness=0, cursor="fleur")
         x_scroll = ttk.Scrollbar(image_frame, orient=tk.HORIZONTAL, command=self.canvas.xview)
         y_scroll = ttk.Scrollbar(image_frame, orient=tk.VERTICAL, command=self.canvas.yview)
@@ -1167,7 +1243,6 @@ class OCRInspectionTool:
         self.canvas.bind("<B2-Motion>", self.drag_pan)
         self.canvas.bind("<Double-Button-1>", lambda event: self.fit_page())
 
-        # Main Tabbed Notebook Frame
         self.notebook = ttk.Notebook(result_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
@@ -1176,7 +1251,6 @@ class OCRInspectionTool:
 
         ttk.Label(self.tab_raw, text="YOLO Detections & Raw OCR Results", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(2, 5))
 
-        # Restored YOLO Box Colours Legend
         legend_frame = ttk.LabelFrame(self.tab_raw, text="YOLO box colours", padding=5)
         legend_frame.pack(fill=tk.X, pady=(0, 7))
 
@@ -1193,10 +1267,9 @@ class OCRInspectionTool:
             tag_name = f"legend_{class_name}"
             self.colour_legend.tag_configure(tag_name, foreground=rgb_to_hex(colour), font=("Segoe UI", 9, "bold"))
             description = legend_descriptions.get(class_name, class_name)
-            self.colour_legend.insert(tk.END, f"■  {class_id}  {description}\n", tag_name)
+            self.colour_legend.insert(tk.END, f"■   {class_id}   {description}\n", tag_name)
         self.colour_legend.config(state=tk.DISABLED)
 
-        # Restored Timing Information
         timing_frame = ttk.LabelFrame(self.tab_raw, text="Processing time", padding=5)
         timing_frame.pack(fill=tk.X, pady=(0, 7))
 
@@ -1205,7 +1278,6 @@ class OCRInspectionTool:
         self.timing_text.insert(tk.END, "Run YOLO or YOLO + OCR to display timing.")
         self.timing_text.config(state=tk.DISABLED)
 
-        # Raw Table
         columns = ("no", "class", "raw", "final", "det_conf", "ocr_conf", "warning")
         raw_container = ttk.Frame(self.tab_raw)
         raw_container.pack(fill=tk.BOTH, expand=True)
@@ -1256,20 +1328,20 @@ class OCRInspectionTool:
             ttk.Label(top_bar, text=f"{tab_name} Structured Results", font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
             ttk.Button(top_bar, text="Export CSV", command=lambda d=rows_data, name=tab_name: self.export_chem_csv(d, name)).pack(side=tk.RIGHT)
 
-            chem_columns = ("element", "value", "unit", "limit")
+            chem_columns = ("element", "min", "max", "unit")
             container = ttk.Frame(tab_frame)
             container.pack(fill=tk.BOTH, expand=True)
 
             tree = ttk.Treeview(container, columns=chem_columns, show="headings", selectmode="extended")
             tree.heading("element", text="Chemical Element")
-            tree.heading("value", text="Value")
+            tree.heading("min", text="Min")
+            tree.heading("max", text="Max")
             tree.heading("unit", text="Unit")
-            tree.heading("limit", text="Limit / Indicator")
 
             tree.column("element", width=110, anchor="w")
-            tree.column("value", width=150, anchor="w")
+            tree.column("min", width=110, anchor="w")
+            tree.column("max", width=110, anchor="w")
             tree.column("unit", width=80, anchor="w")
-            tree.column("limit", width=110, anchor="w")
 
             y_scroll = ttk.Scrollbar(container, orient=tk.VERTICAL, command=tree.yview)
             x_scroll = ttk.Scrollbar(container, orient=tk.HORIZONTAL, command=tree.xview)
@@ -1286,12 +1358,11 @@ class OCRInspectionTool:
 
             for idx, r in enumerate(rows_data):
                 item_id = str(idx)
-                val_display = r["value"]
-                if r["edited"]:
-                    val_display = f"{r['value']}  [was: {r['orig_value']}]"
+                min_disp = f"{r['min']} [was: {r['orig_min']}]" if (r["edited"] and r["min"] != r["orig_min"]) else r["min"]
+                max_disp = f"{r['max']} [was: {r['orig_max']}]" if (r["edited"] and r["max"] != r["orig_max"]) else r["max"]
 
                 tag = "edited_val" if r["edited"] else ""
-                tree.insert("", tk.END, iid=item_id, values=(r["element"], val_display, r["unit"], r["limit"]), tags=(tag,))
+                tree.insert("", tk.END, iid=item_id, values=(r["element"], min_disp, max_disp, r["unit"]), tags=(tag,))
 
             tree.bind("<Double-1>", lambda event, t=tree, data=rows_data: self.on_cell_double_click(event, t, data))
             self._setup_chem_tree_copy(tree)
@@ -1349,9 +1420,9 @@ class OCRInspectionTool:
         try:
             with open(file_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["Chemical Element", "Value", "Unit", "Limit / Indicator"])
+                writer.writerow(["Chemical Element", "Min", "Max", "Unit"])
                 for row in rows_data:
-                    writer.writerow([row["element"], row["value"], row["unit"], row["limit"]])
+                    writer.writerow([row["element"], row["min"], row["max"], row["unit"]])
             messagebox.showinfo("Export Successful", f"Table exported to:\n{file_path}")
         except Exception as e:
             messagebox.showerror("Export Error", str(e))
@@ -1367,7 +1438,7 @@ class OCRInspectionTool:
             return
 
         col_index = int(column.replace("#", "")) - 1
-        col_keys = ["element", "value", "unit", "limit"]
+        col_keys = ["element", "min", "max", "unit"]
         target_key = col_keys[col_index]
 
         row_idx = int(row_id)
@@ -1386,15 +1457,15 @@ class OCRInspectionTool:
                 rows_data[row_idx][target_key] = new_text
                 rows_data[row_idx]["edited"] = True
 
-                val_display = rows_data[row_idx]["value"]
-                if rows_data[row_idx]["edited"]:
-                    val_display = f"{rows_data[row_idx]['value']}  [was: {rows_data[row_idx]['orig_value']}]"
+                r = rows_data[row_idx]
+                min_disp = f"{r['min']} [was: {r['orig_min']}]" if (r["edited"] and r["min"] != r["orig_min"]) else r["min"]
+                max_disp = f"{r['max']} [was: {r['orig_max']}]" if (r["edited"] and r["max"] != r["orig_max"]) else r["max"]
 
                 tree.item(row_id, values=(
-                    rows_data[row_idx]["element"],
-                    val_display,
-                    rows_data[row_idx]["unit"],
-                    rows_data[row_idx]["limit"]
+                    r["element"],
+                    min_disp,
+                    max_disp,
+                    r["unit"]
                 ), tags=("edited_val",))
 
         entry.bind("<Return>", save_edit)
@@ -1506,10 +1577,35 @@ class OCRInspectionTool:
             processing_started = time.perf_counter()
             yolo_started = time.perf_counter()
 
-            result = self.model.predict(
+            first_pass_result = self.model.predict(
                 source=image, imgsz=IMAGE_SIZE, conf=CONFIDENCE, iou=IOU_THRESHOLD,
                 max_det=MAX_DETECTIONS, device=DEVICE, agnostic_nms=False, verbose=False
             )[0]
+
+            temp_detections = []
+            if first_pass_result.boxes is not None:
+                for box in first_pass_result.boxes:
+                    class_id = int(box.cls[0].cpu().item())
+                    coordinates = box.xyxy[0].cpu().numpy().round().astype(int)
+                    x1, y1, x2, y2 = coordinates
+                    temp_detections.append({
+                        "class_id": class_id,
+                        "class_name": str(self.model.names[class_id]),
+                        "cx": (x1 + x2) / 2.0, "cy": (y1 + y2) / 2.0,
+                    })
+
+            header_angle = estimate_angle_from_headers(temp_detections)
+
+            if abs(header_angle) > 0.3:
+                image, _ = rotate_image_by_angle(image, header_angle)
+                self.current_image = image.copy()
+
+                result = self.model.predict(
+                    source=image, imgsz=IMAGE_SIZE, conf=CONFIDENCE, iou=IOU_THRESHOLD,
+                    max_det=MAX_DETECTIONS, device=DEVICE, agnostic_nms=False, verbose=False
+                )[0]
+            else:
+                result = first_pass_result
 
             yolo_seconds = time.perf_counter() - yolo_started
             ocr_load_seconds = 0.0
@@ -1622,7 +1718,7 @@ class OCRInspectionTool:
             self.tables_data = extract_chemical_tables_by_region(detections)
             self.update_chemical_tables_notebook()
 
-        self.fit_page()
+        self.show_image(self.get_display_image())
         self.busy = False
         self.open_button.config(state=tk.NORMAL)
         self.run_button.config(state=tk.NORMAL)
@@ -1801,11 +1897,6 @@ def main():
 
     model = YOLO(str(MODEL_PATH))
     verify_model_classes(model)
-
-    print("\nYOLO loaded successfully.\nModel classes:\n" + "-" * 70)
-    for class_id, class_name in model.names.items():
-        print(f"{class_id}: {class_name}")
-    print("-" * 70)
 
     reader = None
     root = tk.Tk()
