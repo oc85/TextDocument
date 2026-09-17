@@ -938,66 +938,270 @@ def normalise_value(text):
 
 
 def normalise_header(text):
+    """
+    Semantic header normalisation.
+
+    IMPORTANT:
+    Preserve BOTH column meaning and unit.
+
+    Examples:
+        Min %       -> Min %
+        Max %       -> Max %
+        Minimum %   -> Min %
+        Maximum %   -> Max %
+        Min ppm     -> Min ppm
+        Max ppm     -> Max ppm
+        Percentage% -> Percentage %
+        Element     -> Element
+    """
+
     original = clean_text(text)
+
     if not original:
         return "", False
 
     lower = original.lower()
+
+    # Keep letters for semantic matching
     compact = re.sub(r"[^a-z]", "", lower)
 
-    # Header OCR is deliberately semantic: YOLO already says this box is a
-    # header, so surrounding OCR garbage must not defeat a clearly visible
-    # header keyword. Examples:
-    #   "I_ Element Bismus" -> "Element"
-    #   "Symble EI"         -> "Symbol"
-    #   "Ld1R Percentage%"  -> "Percentage %"
-    header_keyword_rules = (
-        (("percentage", "percentag", "percent", "perc"), "Percentage %"),
-        (("element", "elernent", "elemnt", "elment", "e1ement"), "Element"),
-        (("symbol", "symble", "symbo", "symbl", "syrnbol", "syml"), "Symbol"),
-        (("analysis", "ana1ysis", "analysls", "anaiysis"), "Analysis"),
+    # ==========================================================
+    # 1. DETECT UNIT FIRST
+    # ==========================================================
+
+    unit = None
+
+    if (
+        "%" in original
+        or "percentage" in compact
+        or "percent" in compact
+        or "percentag" in compact
+        or "perc" in compact
+    ):
+        unit = "%"
+
+    elif "ppm" in compact:
+        unit = "ppm"
+
+    elif "ppb" in compact:
+        unit = "ppb"
+
+    elif "wt" in compact and "%" in original:
+        unit = "wt%"
+
+    # ==========================================================
+    # 2. DETECT MIN / MAX
+    #
+    # Do this BEFORE generic Percentage mapping.
+    # ==========================================================
+
+    min_forms = (
+        "min",
+        "minimum",
+        "minima",
+        "rnin",
+        "rninimum",
+        "mn",
     )
+
+    max_forms = (
+        "max",
+        "maximum",
+        "maxima",
+        "rnax",
+        "rnaximum",
+        "mx",
+        "m4x",
+    )
+
+    is_min = any(
+        form in compact
+        for form in min_forms
+    )
+
+    is_max = any(
+        form in compact
+        for form in max_forms
+    )
+
+    # ----------------------------------------------------------
+    # MIN + UNIT
+    # ----------------------------------------------------------
+
+    if is_min:
+
+        if unit:
+            return f"Min {unit}", True
+
+        return "Min", True
+
+    # ----------------------------------------------------------
+    # MAX + UNIT
+    # ----------------------------------------------------------
+
+    if is_max:
+
+        if unit:
+            return f"Max {unit}", True
+
+        return "Max", True
+
+    # ==========================================================
+    # 3. OTHER SEMANTIC HEADERS
+    # ==========================================================
+
+    header_keyword_rules = (
+
+        (
+            ("element", "elernent", "elemnt", "elment", "e1ement"),
+            "Element"
+        ),
+
+        (
+            ("symbol", "symble", "symbo", "symbl", "syrnbol", "syml"),
+            "Symbol"
+        ),
+
+        (
+            ("analysis", "ana1ysis", "analysls", "anaiysis"),
+            "Analysis"
+        ),
+    )
+
     for variants, final in header_keyword_rules:
-        if any(token in compact for token in variants):
+
+        if any(
+            token in compact
+            for token in variants
+        ):
             return final, True
 
-    # A standalone % header is also a percentage heading.
-    if "%" in original and len(re.sub(r"[^A-Za-z]", "", original)) <= 6:
+    # ==========================================================
+    # 4. GENERIC UNIT HEADER
+    # ==========================================================
+
+    if unit == "%":
         return "Percentage %", True
 
+    if unit == "ppm":
+        return "ppm", True
+
+    if unit == "ppb":
+        return "ppb", True
+
+    if unit == "wt%":
+        return "wt%", True
+
+    # ==========================================================
+    # 5. BATCH / LOT / WEIGHT
+    # ==========================================================
+
     batch_forms = {
-        "batch", "bat", "atch", "btch", "bafch", "balch", "baich",
-        "batchno", "batchnum", "batchnumber", "batchnr",
-        "batnumber", "atchnumber", "btchnumber",
+        "batch",
+        "bat",
+        "atch",
+        "btch",
+        "bafch",
+        "balch",
+        "baich",
+        "batchno",
+        "batchnum",
+        "batchnumber",
+        "batchnr",
+        "batnumber",
+        "atchnumber",
+        "btchnumber",
     }
+
     lot_forms = {
-        "lot", "lots", "lotno", "lotnumber", "lotsnumber", "lotnum", "lotnr",
+        "lot",
+        "lots",
+        "lotno",
+        "lotnumber",
+        "lotsnumber",
+        "lotnum",
+        "lotnr",
     }
+
     weight_forms = {
-        "weight", "weights", "wight", "weght", "weignt", "we1ght",
-        "weigt", "wieght", "netweight", "nettweight", "weightnet",
-        "netwt", "wt", "wgt", "mass", "netmass", "massnet",
+        "weight",
+        "weights",
+        "wight",
+        "weght",
+        "weignt",
+        "we1ght",
+        "weigt",
+        "wieght",
+        "netweight",
+        "nettweight",
+        "weightnet",
+        "netwt",
+        "wt",
+        "wgt",
+        "mass",
+        "netmass",
+        "massnet",
     }
 
     has_number = (
-        "number" in compact or "nurnber" in compact
+        "number" in compact
+        or "nurnber" in compact
         or compact.endswith(("no", "num", "nr"))
     )
-    has_batch = any(form in compact for form in batch_forms)
-    has_lot = any(form in compact for form in lot_forms)
-    has_weight = any(form in compact for form in weight_forms)
-    has_net = "net" in compact or "nett" in compact
+
+    has_batch = any(
+        form in compact
+        for form in batch_forms
+    )
+
+    has_lot = any(
+        form in compact
+        for form in lot_forms
+    )
+
+    has_weight = any(
+        form in compact
+        for form in weight_forms
+    )
+
+    has_net = (
+        "net" in compact
+        or "nett" in compact
+    )
+
     has_mass = "mass" in compact
 
     if has_batch:
-        return "Batch number" if has_number else "Batch", True
+
+        return (
+            "Batch number"
+            if has_number
+            else "Batch"
+        ), True
+
     if has_lot:
-        return "Lot number" if has_number else "Lot", True
+
+        return (
+            "Lot number"
+            if has_number
+            else "Lot"
+        ), True
+
     if has_weight:
+
         if has_net or has_mass:
             return "Net weight", True
+
         return "Weight", True
-    if compact in {"number", "numbe", "numb", "nurnber", "nurnbcr", "nurnbr"}:
+
+    if compact in {
+        "number",
+        "numbe",
+        "numb",
+        "nurnber",
+        "nurnbcr",
+        "nurnbr",
+    }:
         return "Batch number", True
 
     return original, True
@@ -1083,7 +1287,30 @@ def read_fast_header(reader, crop):
         return "", 0.0, False, ""
 
     prepared = []
-    semantic_headers = {"Batch", "Batch number", "Lot", "Lot number", "Weight", "Net weight", "Analysis", "Element", "Symbol", "Percentage %"}
+    semantic_headers = {
+    "Batch",
+    "Batch number",
+    "Lot",
+    "Lot number",
+    "Weight",
+    "Net weight",
+    "Analysis",
+    "Element",
+    "Symbol",
+    "Percentage %",
+    "Min",
+    "Max",
+    "Min %",
+    "Max %",
+    "Min ppm",
+    "Max ppm",
+    "Min ppb",
+    "Max ppb",
+    "Min wt%",
+    "Max wt%",
+}
+    
+
     for item in candidates:
         final, valid = normalise_header(item["raw"])
         if not final:
@@ -1257,9 +1484,27 @@ def read_multiline_header_advanced(reader, crop):
 
         final, _ = normalise_header(raw)
         semantic = final in {
-            "Batch", "Batch number", "Lot", "Lot number", "Weight", "Net weight",
-            "Analysis", "Element", "Symbol", "Percentage %"
-        }
+    "Batch",
+    "Batch number",
+    "Lot",
+    "Lot number",
+    "Weight",
+    "Net weight",
+    "Analysis",
+    "Element",
+    "Symbol",
+    "Percentage %",
+    "Min",
+    "Max",
+    "Min %",
+    "Max %",
+    "Min ppm",
+    "Max ppm",
+    "Min ppb",
+    "Max ppb",
+    "Min wt%",
+    "Max wt%",
+}
 
         prepared.append({
             **item, "raw": raw, "final": final,
@@ -3721,6 +3966,76 @@ class OCRInspectionTool:
 # ============================================================
 # VERIFY MODEL & MAIN ENTRY
 # ============================================================
+def normalise_table_header(text):
+    """
+    Preserve BOTH column meaning and unit.
+
+    Examples:
+        'Min %'        -> 'Min %'
+        'MIN%'         -> 'Min %'
+        'Minimum %'    -> 'Min %'
+        'Max %'        -> 'Max %'
+        'MAX%'         -> 'Max %'
+        'Maximum %'    -> 'Max %'
+        'Min ppm'      -> 'Min ppm'
+        'Max ppm'      -> 'Max ppm'
+        'Percentage %' -> 'Percentage %'
+    """
+
+    raw = clean_text(text)
+    low = raw.lower()
+
+    # Remove common OCR spacing/noise for matching
+    compact = re.sub(r"[^a-z0-9%]+", "", low)
+
+    # ----------------------------------------------------------
+    # Detect unit independently
+    # ----------------------------------------------------------
+
+    unit = None
+
+    if "%" in raw or "percent" in low or "percentage" in low:
+        unit = "%"
+
+    elif "ppm" in compact:
+        unit = "ppm"
+
+    elif "ppb" in compact:
+        unit = "ppb"
+
+    # ----------------------------------------------------------
+    # Detect MIN / MAX independently
+    # ----------------------------------------------------------
+
+    is_min = (
+        "min" in compact
+        or "minimum" in low
+        or compact.startswith("mn")
+    )
+
+    is_max = (
+        "max" in compact
+        or "maximum" in low
+        or compact.startswith("mx")
+    )
+
+    # ----------------------------------------------------------
+    # Return combined semantic header
+    # ----------------------------------------------------------
+
+    if is_min:
+        return f"Min {unit}" if unit else "Min"
+
+    if is_max:
+        return f"Max {unit}" if unit else "Max"
+
+    if unit == "%":
+        return "Percentage %"
+
+    if unit:
+        return unit
+
+    return raw
 
 def verify_model_classes(model):
     actual = {int(key): str(value) for key, value in model.names.items()}
