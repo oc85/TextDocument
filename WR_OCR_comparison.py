@@ -27,7 +27,7 @@ from ultralytics import YOLO
 # 1. MAIN SETTINGS
 # ============================================================
 
-MODEL_PATH = Path(r"best.pt")
+MODEL_PATH = Path(r"D:\Kaggle\WRtools_005\best.pt")
 
 IMAGE_SIZE = 1280
 
@@ -2115,178 +2115,638 @@ def extract_chemical_tables_by_region(detections):
 
 
 def parse_single_table_tokens(tokens):
-    symbols = [t for t in tokens if t["class_name"] == "element_symbol" and t["text"] in VALID_ELEMENTS]
+    """
+    Chemical-table parser using intelligent horizontal projection.
+
+    Main rule:
+        The Y-centre of every element_symbol defines its row.
+
+    Row boundaries:
+        Halfway between the Y-centres of neighbouring element symbols.
+
+    Therefore a value can belong to only ONE chemical element row.
+
+    Within each row:
+        X position / Min-Max headers determine the column.
+
+    If several detections compete:
+        1. strongest horizontal alignment with element centre
+        2. YOLO/OCR confidence
+    """
+
+    # ==========================================================
+    # 1. GET CHEMICAL ELEMENT SYMBOLS
+    # ==========================================================
+
+    symbols = [
+        t for t in tokens
+        if t["class_name"] == "element_symbol"
+        and t["text"] in VALID_ELEMENTS
+    ]
+
     if not symbols:
         return []
 
     symbols.sort(key=lambda s: (s["cy"], s["cx"]))
 
+    # ==========================================================
+    # 2. REMOVE CLOSE DUPLICATE SYMBOLS
+    # ==========================================================
+
     filtered_symbols = []
+
     for s in symbols:
+
         if filtered_symbols:
+
             prev = filtered_symbols[-1]
-            dist = np.sqrt((prev["cx"] - s["cx"]) ** 2 + (prev["cy"] - s["cy"]) ** 2)
+
+            dist = np.sqrt(
+                (prev["cx"] - s["cx"]) ** 2 +
+                (prev["cy"] - s["cy"]) ** 2
+            )
+
             if prev["text"] == s["text"] and dist < 120:
                 continue
+
         filtered_symbols.append(s)
 
     symbols = filtered_symbols
-    values = [t for t in tokens if t["class_name"] == "element_value"]
-    units = [t for t in tokens if t["class_name"] == "unit"]
-    headers = [t for t in tokens if t["class_name"] == "headers"]
-    limits = [t for t in tokens if t["class_name"] == "limit_indicator"]
+
+    # ==========================================================
+    # 3. DETECTION GROUPS
+    # ==========================================================
+
+    values = [
+        t for t in tokens
+        if t["class_name"] == "element_value"
+    ]
+
+    units = [
+        t for t in tokens
+        if t["class_name"] == "unit"
+    ]
+
+    headers = [
+        t for t in tokens
+        if t["class_name"] == "headers"
+    ]
+
+    limits = [
+        t for t in tokens
+        if t["class_name"] == "limit_indicator"
+    ]
+
+    # ==========================================================
+    # 4. FIND MIN / MAX HEADER CENTRES
+    # ==========================================================
 
     min_hdr_center = None
     max_hdr_center = None
 
     for h in headers:
-        htext = (h.get("raw_text") or h.get("text", "")).lower()
-        h_center = (h["x1"] + h["x2"]) / 2.0
+
+        htext = clean_text(
+            h.get("raw_text") or h.get("text", "")
+        ).lower()
+
+        h_center = h["cx"]
+
         if "min" in htext:
             min_hdr_center = h_center
+
         elif "max" in htext:
             max_hdr_center = h_center
 
+    # ==========================================================
+    # 5. DETECTION CONFIDENCE
+    # ==========================================================
+
+    def detection_confidence(det):
+
+        candidates = [
+            det.get("ocr_confidence"),
+            det.get("ocr_conf"),
+            det.get("confidence"),
+            det.get("conf"),
+        ]
+
+        for value in candidates:
+
+            if value is None:
+                continue
+
+            try:
+                value = float(value)
+
+                if value > 1.0:
+                    value /= 100.0
+
+                return max(0.0, min(value, 1.0))
+
+            except Exception:
+                pass
+
+        return 0.0
+
+    # ==========================================================
+    # 6. BUILD INTELLIGENT ROW BOUNDARIES
+    # ==========================================================
+
+    row_regions = []
+
+    for i, sym in enumerate(symbols):
+
+        current_y = float(sym["cy"])
+
+        # ------------------------------------------------------
+        # UPPER boundary
+        # ------------------------------------------------------
+
+        if i == 0:
+
+            if len(symbols) > 1:
+
+                next_y = float(symbols[i + 1]["cy"])
+                gap = next_y - current_y
+
+                upper = current_y - gap / 2.0
+
+            else:
+
+                upper = float(sym["y1"])
+
+        else:
+
+            previous_y = float(symbols[i - 1]["cy"])
+
+            upper = (
+                previous_y +
+                current_y
+            ) / 2.0
+
+        # ------------------------------------------------------
+        # LOWER boundary
+        # ------------------------------------------------------
+
+        if i == len(symbols) - 1:
+
+            if len(symbols) > 1:
+
+                previous_y = float(symbols[i - 1]["cy"])
+                gap = current_y - previous_y
+
+                lower = current_y + gap / 2.0
+
+            else:
+
+                lower = float(sym["y2"])
+
+        else:
+
+            next_y = float(symbols[i + 1]["cy"])
+
+            lower = (
+                current_y +
+                next_y
+            ) / 2.0
+
+        row_regions.append({
+            "symbol": sym,
+            "upper": upper,
+            "lower": lower,
+        })
+
+    # ==========================================================
+    # 7. SCORE A DETECTION AGAINST A ROW
+    # ==========================================================
+
+    def row_score(det, sym, upper, lower):
+        """
+        Strong preference for detection centre lying on the same
+        horizontal projection as the element-symbol centre.
+        """
+
+        sym_y = float(sym["cy"])
+        det_y = float(det["cy"])
+
+        dy = abs(det_y - sym_y)
+
+        half_height = max(
+            (lower - upper) / 2.0,
+            1.0
+        )
+
+        alignment = max(
+            0.0,
+            1.0 - dy / half_height
+        )
+
+        conf = detection_confidence(det)
+
+        # Geometry deliberately stronger than OCR confidence.
+        return (
+            0.80 * alignment +
+            0.20 * conf
+        )
+
+    # ==========================================================
+    # 8. ASSIGN EVERY VALUE TO EXACTLY ONE ELEMENT ROW
+    # ==========================================================
+
+    values_by_row = {
+        i: []
+        for i in range(len(row_regions))
+    }
+
+    for val in values:
+
+        val_y = float(val["cy"])
+
+        possible_rows = []
+
+        for i, region in enumerate(row_regions):
+
+            if region["upper"] <= val_y < region["lower"]:
+
+                score = row_score(
+                    val,
+                    region["symbol"],
+                    region["upper"],
+                    region["lower"]
+                )
+
+                possible_rows.append(
+                    (score, i)
+                )
+
+        # Normally only one row is possible because the regions
+        # do not overlap. MAX score protects boundary cases.
+        if possible_rows:
+
+            possible_rows.sort(
+                key=lambda item: item[0],
+                reverse=True
+            )
+
+            best_score, best_row = possible_rows[0]
+
+            value_copy = dict(val)
+            value_copy["_row_score"] = best_score
+
+            values_by_row[best_row].append(value_copy)
+
+    # ==========================================================
+    # 9. ASSIGN LIMITS TO EXACTLY ONE ROW
+    # ==========================================================
+
+    limits_by_row = {
+        i: []
+        for i in range(len(row_regions))
+    }
+
+    for lim in limits:
+
+        lim_y = float(lim["cy"])
+
+        possible_rows = []
+
+        for i, region in enumerate(row_regions):
+
+            if region["upper"] <= lim_y < region["lower"]:
+
+                score = row_score(
+                    lim,
+                    region["symbol"],
+                    region["upper"],
+                    region["lower"]
+                )
+
+                possible_rows.append(
+                    (score, i)
+                )
+
+        if possible_rows:
+
+            possible_rows.sort(
+                key=lambda item: item[0],
+                reverse=True
+            )
+
+            _, best_row = possible_rows[0]
+
+            limits_by_row[best_row].append(lim)
+
+    # ==========================================================
+    # 10. ASSIGN UNITS TO EXACTLY ONE ROW
+    # ==========================================================
+
+    units_by_row = {
+        i: []
+        for i in range(len(row_regions))
+    }
+
+    for unit in units:
+
+        unit_y = float(unit["cy"])
+
+        possible_rows = []
+
+        for i, region in enumerate(row_regions):
+
+            if region["upper"] <= unit_y < region["lower"]:
+
+                score = row_score(
+                    unit,
+                    region["symbol"],
+                    region["upper"],
+                    region["lower"]
+                )
+
+                possible_rows.append(
+                    (score, i)
+                )
+
+        if possible_rows:
+
+            possible_rows.sort(
+                key=lambda item: item[0],
+                reverse=True
+            )
+
+            _, best_row = possible_rows[0]
+
+            units_by_row[best_row].append(unit)
+
+    # ==========================================================
+    # 11. BUILD STRUCTURED CHEMICAL ROWS
+    # ==========================================================
+
     rows = []
-    for sym in symbols:
+
+    for row_index, region in enumerate(row_regions):
+
+        sym = region["symbol"]
         sym_text = sym["text"]
 
-        line_values = []
-        for val in values:
-            dy = abs(val["cy"] - sym["cy"])
-            dx = val["cx"] - sym["cx"]
+        line_values = values_by_row[row_index]
 
-            if dy < 45 and 0 < dx < 1800:
-                symbol_between = any(
-                    s is not sym and abs(s["cy"] - sym["cy"]) < 45 and sym["cx"] < s["cx"] < val["cx"]
-                    for s in symbols
-                )
-                if not symbol_between:
-                    line_values.append(val)
+        # Values left -> right
+        line_values.sort(
+            key=lambda v: v["cx"]
+        )
 
-        line_values.sort(key=lambda v: v["cx"])
+        row_limits = limits_by_row[row_index]
+
+        row_units = units_by_row[row_index]
 
         val_text = "-"
         min_val = "-"
         max_val = "-"
 
+        # ======================================================
+        # 12. CLASSIFY VALUES INTO VALUE / MIN / MAX
+        # ======================================================
+
         for val in line_values:
+
             curr_text = val["text"]
-            val_cx = val["cx"]
+            val_cx = float(val["cx"])
 
             near_limit = None
-            for lim in limits:
-                if abs(lim["cy"] - val["cy"]) < 30 and abs(lim["cx"] - val["cx"]) < 120:
-                    lim_txt = lim["text"].upper()
-                    if "MIN" in lim_txt:
-                        near_limit = "MIN"
-                    elif "MAX" in lim_txt:
-                        near_limit = "MAX"
 
-            # Additional row rule:
-            # element -> value -> unit -> MIN/MAX -> next element_symbol
-            # Accept a detected MIN/MAX to the right of this value/unit provided
-            # no other element symbol occurs between the value and the indicator.
-            same_row_units = [
-                u for u in units
-                if abs(u["cy"] - val["cy"]) < 35
-                and val["cx"] < u["cx"]
-            ]
-            same_row_units.sort(key=lambda u: u["cx"])
-            row_unit = same_row_units[0] if same_row_units else None
+            # --------------------------------------------------
+            # Explicit MIN/MAX detection on SAME projected row
+            # --------------------------------------------------
 
-            if row_unit is not None:
-                unit_raw = clean_text(row_unit.get("raw_text") or row_unit.get("text", "")).lower()
-                if "min" in unit_raw:
-                    near_limit = "MIN"
-                elif "max" in unit_raw:
-                    near_limit = "MAX"
+            if row_limits:
 
-                next_symbol_x = min(
-                    (
-                        s["cx"] for s in symbols
-                        if s is not sym
-                        and abs(s["cy"] - sym["cy"]) < 45
-                        and s["cx"] > row_unit["cx"]
-                    ),
-                    default=float("inf")
+                matching_limits = sorted(
+                    row_limits,
+                    key=lambda lim:
+                        abs(float(lim["cy"]) - float(val["cy"])) +
+                        0.20 * abs(float(lim["cx"]) - val_cx)
                 )
 
-                trailing_limits = [
-                    lim for lim in limits
-                    if abs(lim["cy"] - row_unit["cy"]) < 35
-                    and row_unit["cx"] < lim["cx"] < next_symbol_x
-                ]
-                trailing_limits.sort(key=lambda lim: lim["cx"])
-                for lim in trailing_limits:
-                    lim_txt = clean_text(lim.get("text", "")).upper()
-                    lim_raw = clean_text(lim.get("raw_text", "")).upper()
-                    combined_limit = f"{lim_txt} {lim_raw}"
-                    if "MIN" in combined_limit:
+                for lim in matching_limits:
+
+                    # Do not use a limit extremely far away
+                    if abs(float(lim["cx"]) - val_cx) > 180:
+                        continue
+
+                    lim_txt = clean_text(
+                        lim.get("text", "")
+                    ).upper()
+
+                    lim_raw = clean_text(
+                        lim.get("raw_text", "")
+                    ).upper()
+
+                    combined = (
+                        lim_txt + " " + lim_raw
+                    )
+
+                    if "MIN" in combined:
                         near_limit = "MIN"
                         break
-                    if "MAX" in combined_limit:
+
+                    if "MAX" in combined:
                         near_limit = "MAX"
                         break
 
-            has_inline_max = any(symb in curr_text for symb in ["<", "<="])
-            has_inline_min = any(symb in curr_text for symb in [">", ">="])
+            # --------------------------------------------------
+            # Inline < / >
+            # --------------------------------------------------
 
-            dist_to_min = abs(val_cx - min_hdr_center) if min_hdr_center is not None else float("inf")
-            dist_to_max = abs(val_cx - max_hdr_center) if max_hdr_center is not None else float("inf")
+            has_inline_max = (
+                "<=" in curr_text or
+                "<" in curr_text
+            )
 
-            if dist_to_min < dist_to_max and dist_to_min < 200:
-                min_val = curr_text
-            elif dist_to_max < dist_to_min and dist_to_max < 200:
-                max_val = curr_text
-            elif near_limit == "MIN" or has_inline_min:
-                min_val = curr_text
-            elif near_limit == "MAX" or has_inline_max:
-                max_val = curr_text
-            else:
-                if len(line_values) == 1:
-                    val_text = curr_text
-                elif len(line_values) >= 2:
-                    if val is line_values[0]:
+            has_inline_min = (
+                ">=" in curr_text or
+                ">" in curr_text
+            )
+
+            # --------------------------------------------------
+            # Header-column distance
+            # --------------------------------------------------
+
+            dist_to_min = (
+                abs(val_cx - min_hdr_center)
+                if min_hdr_center is not None
+                else float("inf")
+            )
+
+            dist_to_max = (
+                abs(val_cx - max_hdr_center)
+                if max_hdr_center is not None
+                else float("inf")
+            )
+
+            # --------------------------------------------------
+            # HEADER POSITION HAS STRONG PRIORITY
+            # --------------------------------------------------
+
+            if (
+                min_hdr_center is not None
+                and dist_to_min < dist_to_max
+                and dist_to_min < 250
+            ):
+
+                # If more than one detection competes for Min,
+                # keep strongest horizontal projection.
+                if min_val == "-":
+                    min_val = curr_text
+
+                else:
+
+                    existing = next(
+                        (
+                            x for x in line_values
+                            if x["text"] == min_val
+                        ),
+                        None
+                    )
+
+                    if (
+                        existing is None or
+                        val.get("_row_score", 0) >
+                        existing.get("_row_score", 0)
+                    ):
                         min_val = curr_text
-                    else:
+
+            elif (
+                max_hdr_center is not None
+                and dist_to_max < dist_to_min
+                and dist_to_max < 250
+            ):
+
+                if max_val == "-":
+                    max_val = curr_text
+
+                else:
+
+                    existing = next(
+                        (
+                            x for x in line_values
+                            if x["text"] == max_val
+                        ),
+                        None
+                    )
+
+                    if (
+                        existing is None or
+                        val.get("_row_score", 0) >
+                        existing.get("_row_score", 0)
+                    ):
                         max_val = curr_text
 
-        unit_text = "%"
-        target_ref = line_values[0] if line_values else sym
-        nearest_unit, unit_dist = None, float("inf")
-        for u in units:
-            d = np.sqrt((u["cx"] - target_ref["cx"])**2 + (u["cy"] - target_ref["cy"])**2)
-            if d < 450 and d < unit_dist:
-                unit_dist, nearest_unit = d, u["text"]
+            elif near_limit == "MIN" or has_inline_min:
 
-        if nearest_unit:
-            unit_text = nearest_unit
+                min_val = curr_text
+
+            elif near_limit == "MAX" or has_inline_max:
+
+                max_val = curr_text
+
+            else:
+
+                # ------------------------------------------------
+                # No explicit headers/limits
+                # ------------------------------------------------
+
+                if len(line_values) == 1:
+
+                    val_text = curr_text
+
+                elif len(line_values) >= 2:
+
+                    # left = minimum
+                    # right = maximum
+                    position = line_values.index(val)
+
+                    if position == 0:
+                        min_val = curr_text
+
+                    elif position == len(line_values) - 1:
+                        max_val = curr_text
+
+                    else:
+                        val_text = curr_text
+
+        # ======================================================
+        # 13. UNIT FOR THIS EXACT ROW
+        # ======================================================
+
+        unit_text = "%"
+
+        if row_units:
+
+            reference_y = float(sym["cy"])
+
+            best_unit = max(
+                row_units,
+                key=lambda u: (
+                    -abs(float(u["cy"]) - reference_y),
+                    detection_confidence(u)
+                )
+            )
+
+            unit_text = best_unit["text"]
+
         else:
+
+            # Header-based unit fallback
             for h in headers:
-                if h["x1"] - 20 <= sym["cx"] <= h["x2"] + 20 and h["cy"] < sym["cy"]:
-                    h_lower = h["raw_text"].lower() if h.get("raw_text") else h["text"].lower()
+
+                if (
+                    h["x1"] - 20
+                    <= sym["cx"]
+                    <= h["x2"] + 20
+                    and h["cy"] < sym["cy"]
+                ):
+
+                    h_lower = clean_text(
+                        h.get("raw_text")
+                        or h.get("text", "")
+                    ).lower()
+
                     if "ppm" in h_lower:
                         unit_text = "ppm"
                         break
+
                     elif "ppb" in h_lower:
                         unit_text = "ppb"
                         break
+
                     elif "%" in h_lower or "percent" in h_lower:
                         unit_text = "%"
                         break
 
+        # ======================================================
+        # 14. SAVE ROW
+        # ======================================================
+
         rows.append({
             "element": sym_text,
-            "orig_val": val_text, "val": val_text,
-            "orig_min": min_val, "min": min_val,
-            "orig_max": max_val, "max": max_val,
-            "orig_unit": unit_text, "unit": unit_text,
+
+            "orig_val": val_text,
+            "val": val_text,
+
+            "orig_min": min_val,
+            "min": min_val,
+
+            "orig_max": max_val,
+            "max": max_val,
+
+            "orig_unit": unit_text,
+            "unit": unit_text,
+
             "edited": False
         })
 
     return rows
-
 
 # ============================================================
 # GUI CLASS WITH FULL INSPECTOR & MULTI-TABLE SUPPORT
