@@ -2443,28 +2443,7 @@ def parse_single_table_tokens(tokens):
     ]
 
     # ==========================================================
-    # 4. FIND MIN / MAX HEADER CENTRES
-    # ==========================================================
-
-    min_hdr_center = None
-    max_hdr_center = None
-
-    for h in headers:
-
-        htext = clean_text(
-            h.get("raw_text") or h.get("text", "")
-        ).lower()
-
-        h_center = h["cx"]
-
-        if "min" in htext:
-            min_hdr_center = h_center
-
-        elif "max" in htext:
-            max_hdr_center = h_center
-
-    # ==========================================================
-    # 5. DETECTION CONFIDENCE
+    # 4. DETECTION CONFIDENCE
     # ==========================================================
 
     def detection_confidence(det):
@@ -2493,6 +2472,290 @@ def parse_single_table_tokens(tokens):
                 pass
 
         return 0.0
+
+    # ==========================================================
+    # 4. BUILD HEADER COLUMN PROJECTIONS
+    # ==========================================================
+    #
+    # Header OCR tells us WHAT a column probably means.
+    # Header X-position tells us WHERE that column exists.
+    #
+    # Once Min / Max columns are established, every value below
+    # them is classified by vertical X projection.
+    # ==========================================================
+
+    min_hdr_center = None
+    max_hdr_center = None
+
+    min_hdr = None
+    max_hdr = None
+
+    header_candidates = []
+
+    for h in headers:
+
+        raw = clean_text(
+            h.get("raw_text") or ""
+        )
+
+        final = clean_text(
+            h.get("text") or ""
+        )
+
+        combined = f"{raw} {final}".lower()
+
+        compact = re.sub(
+            r"[^a-z%]",
+            "",
+            combined
+        )
+
+        header_candidates.append({
+            "det": h,
+            "cx": float(h["cx"]),
+            "x1": float(h["x1"]),
+            "x2": float(h["x2"]),
+            "raw": raw,
+            "final": final,
+            "combined": combined,
+            "compact": compact,
+        })
+
+    # ----------------------------------------------------------
+    # Explicit semantic recognition first
+    # ----------------------------------------------------------
+
+    for item in header_candidates:
+
+        text = item["compact"]
+
+        if (
+            "min" in text
+            or "minimum" in text
+            or "rnin" in text
+        ):
+
+            if min_hdr is None:
+                min_hdr = item
+
+            elif detection_confidence(item["det"]) > \
+                    detection_confidence(min_hdr["det"]):
+
+                min_hdr = item
+
+        if (
+            "max" in text
+            or "maximum" in text
+            or "rnax" in text
+        ):
+
+            if max_hdr is None:
+                max_hdr = item
+
+            elif detection_confidence(item["det"]) > \
+                    detection_confidence(max_hdr["det"]):
+
+                max_hdr = item
+
+    # ----------------------------------------------------------
+    # GEOMETRIC RECOVERY
+    #
+    # If OCR lost Min or Max but we have neighbouring header
+    # columns, recover their meaning from horizontal order.
+    #
+    # Typical chemical table:
+    #
+    # Element | Min | Max
+    #
+    # We deliberately use geometry only to recover a missing
+    # semantic header, not to overwrite a correctly recognised
+    # header.
+    # ----------------------------------------------------------
+
+    ordered_headers = sorted(
+        header_candidates,
+        key=lambda item: item["cx"]
+    )
+
+    chemical_headers = []
+
+    for item in ordered_headers:
+
+        text = item["compact"]
+
+        # Exclude the element/symbol description column.
+        if (
+            "element" in text
+            or "symbol" in text
+            or "analysis" in text
+        ):
+            continue
+
+        chemical_headers.append(item)
+
+    # ----------------------------------------------------------
+    # STRONG TWO-COLUMN GEOMETRY
+    # ----------------------------------------------------------
+    # In the common Element | Min | Max layout, OCR can call the
+    # left header "Max" or reduce either header to "Percentage %".
+    # When two numeric header regions exist, their horizontal order
+    # is more reliable: left = Min and right = Max.
+
+    if len(chemical_headers) >= 2:
+
+        numeric_headers = sorted(
+            chemical_headers,
+            key=lambda item: item["cx"]
+        )[-2:]
+
+        min_hdr = numeric_headers[0]
+        max_hdr = numeric_headers[1]
+
+        # Preserve the unit while correcting the semantic label used
+        # by this parser and by any later structured-result display.
+        def projected_header_unit(item):
+            text = (
+                clean_text(item.get("raw", ""))
+                + " "
+                + clean_text(item.get("final", ""))
+            ).lower()
+
+            if "ppm" in text:
+                return "ppm"
+            if "ppb" in text:
+                return "ppb"
+            if "wt%" in text or "wt %" in text:
+                return "wt%"
+            if "%" in text or "percent" in text:
+                return "%"
+            return ""
+
+        min_unit = projected_header_unit(min_hdr)
+        max_unit = projected_header_unit(max_hdr)
+
+        min_hdr["final"] = (
+            f"Min {min_unit}" if min_unit else "Min"
+        )
+        max_hdr["final"] = (
+            f"Max {max_unit}" if max_unit else "Max"
+        )
+
+        min_hdr["det"]["text"] = min_hdr["final"]
+        max_hdr["det"]["text"] = max_hdr["final"]
+
+    # ----------------------------------------------------------
+    # If Min is known and the next header to its right exists,
+    # that next column is the strongest Max candidate.
+    # ----------------------------------------------------------
+
+    if min_hdr is not None and max_hdr is None:
+
+        right_headers = [
+            item
+            for item in chemical_headers
+            if item["cx"] > min_hdr["cx"]
+        ]
+
+        if right_headers:
+
+            max_hdr = min(
+                right_headers,
+                key=lambda item:
+                    item["cx"] - min_hdr["cx"]
+            )
+
+    # ----------------------------------------------------------
+    # If Max is known and the previous header to its left exists,
+    # that previous column is the strongest Min candidate.
+    # ----------------------------------------------------------
+
+    if max_hdr is not None and min_hdr is None:
+
+        left_headers = [
+            item
+            for item in chemical_headers
+            if item["cx"] < max_hdr["cx"]
+        ]
+
+        if left_headers:
+
+            min_hdr = min(
+                left_headers,
+                key=lambda item:
+                    max_hdr["cx"] - item["cx"]
+            )
+
+    # ----------------------------------------------------------
+    # Last geometric fallback:
+    #
+    # If OCR failed on BOTH but exactly two numeric header
+    # columns remain, left = Min and right = Max.
+    # ----------------------------------------------------------
+
+    if (
+        min_hdr is None
+        and max_hdr is None
+        and len(chemical_headers) >= 2
+    ):
+
+        # Use the two right-most non-element headers.
+        numeric_headers = sorted(
+            chemical_headers,
+            key=lambda item: item["cx"]
+        )[-2:]
+
+        min_hdr = numeric_headers[0]
+        max_hdr = numeric_headers[1]
+
+    # ----------------------------------------------------------
+    # Final centres
+    # ----------------------------------------------------------
+
+    if min_hdr is not None:
+        min_hdr_center = min_hdr["cx"]
+
+    if max_hdr is not None:
+        max_hdr_center = max_hdr["cx"]
+
+    # ----------------------------------------------------------
+    # Build actual vertical column boundaries.
+    # ----------------------------------------------------------
+
+    min_column_left = None
+    min_column_right = None
+
+    max_column_left = None
+    max_column_right = None
+
+    if (
+        min_hdr_center is not None
+        and max_hdr_center is not None
+    ):
+
+        middle = (
+            min_hdr_center +
+            max_hdr_center
+        ) / 2.0
+
+        separation = abs(
+            max_hdr_center -
+            min_hdr_center
+        )
+
+        # Outer boundaries are symmetrical around the headers.
+        min_column_left = (
+            min_hdr_center -
+            separation / 2.0
+        )
+
+        min_column_right = middle
+
+        max_column_left = middle
+
+        max_column_right = (
+            max_hdr_center +
+            separation / 2.0
+        )
 
     # ==========================================================
     # 6. BUILD INTELLIGENT ROW BOUNDARIES
@@ -2813,34 +3076,31 @@ def parse_single_table_tokens(tokens):
                 ">" in curr_text
             )
 
-            # --------------------------------------------------
-            # Header-column distance
-            # --------------------------------------------------
+            # ==================================================
+            # VERTICAL HEADER PROJECTION
+            # ==================================================
+            # A value's X centre is projected vertically into the
+            # Min or Max header column. Geometry has priority over
+            # imperfect OCR of limit indicators.
 
-            dist_to_min = (
-                abs(val_cx - min_hdr_center)
-                if min_hdr_center is not None
-                else float("inf")
-            )
-
-            dist_to_max = (
-                abs(val_cx - max_hdr_center)
-                if max_hdr_center is not None
-                else float("inf")
-            )
-
-            # --------------------------------------------------
-            # HEADER POSITION HAS STRONG PRIORITY
-            # --------------------------------------------------
+            projected_column = None
 
             if (
-                min_hdr_center is not None
-                and dist_to_min < dist_to_max
-                and dist_to_min < 250
+                min_column_left is not None
+                and min_column_right is not None
+                and min_column_left <= val_cx < min_column_right
             ):
+                projected_column = "MIN"
 
-                # If more than one detection competes for Min,
-                # keep strongest horizontal projection.
+            elif (
+                max_column_left is not None
+                and max_column_right is not None
+                and max_column_left <= val_cx <= max_column_right
+            ):
+                projected_column = "MAX"
+
+            if projected_column == "MIN":
+
                 if min_val == "-":
                     min_val = curr_text
 
@@ -2861,11 +3121,7 @@ def parse_single_table_tokens(tokens):
                     ):
                         min_val = curr_text
 
-            elif (
-                max_hdr_center is not None
-                and dist_to_max < dist_to_min
-                and dist_to_max < 250
-            ):
+            elif projected_column == "MAX":
 
                 if max_val == "-":
                     max_val = curr_text
@@ -2897,9 +3153,7 @@ def parse_single_table_tokens(tokens):
 
             else:
 
-                # ------------------------------------------------
-                # No explicit headers/limits
-                # ------------------------------------------------
+                # No usable header projection or explicit limit.
 
                 if len(line_values) == 1:
 
@@ -2921,11 +3175,12 @@ def parse_single_table_tokens(tokens):
                         val_text = curr_text
 
         # ======================================================
-        # 13. UNIT FOR THIS EXACT ROW
+        # 13. UNIT FROM VALUE-COLUMN PROJECTION
         # ======================================================
 
         unit_text = "%"
 
+        # An explicit unit detected on this exact row has priority.
         if row_units:
 
             reference_y = float(sym["cy"])
@@ -2942,32 +3197,35 @@ def parse_single_table_tokens(tokens):
 
         else:
 
-            # Header-based unit fallback
-            for h in headers:
+            # Use the header belonging to the value column, not the
+            # element-symbol column. If both Min and Max are present,
+            # combine their unit evidence and prefer a specific unit.
+            active_headers = []
 
-                if (
-                    h["x1"] - 20
-                    <= sym["cx"]
-                    <= h["x2"] + 20
-                    and h["cy"] < sym["cy"]
-                ):
+            if min_val != "-" and min_hdr is not None:
+                active_headers.append(min_hdr)
 
-                    h_lower = clean_text(
-                        h.get("raw_text")
-                        or h.get("text", "")
-                    ).lower()
+            if max_val != "-" and max_hdr is not None:
+                active_headers.append(max_hdr)
 
-                    if "ppm" in h_lower:
-                        unit_text = "ppm"
-                        break
+            header_text = " ".join(
+                clean_text(header.get("raw", ""))
+                + " "
+                + clean_text(header.get("final", ""))
+                for header in active_headers
+            ).lower()
 
-                    elif "ppb" in h_lower:
-                        unit_text = "ppb"
-                        break
+            if "ppm" in header_text:
+                unit_text = "ppm"
 
-                    elif "%" in h_lower or "percent" in h_lower:
-                        unit_text = "%"
-                        break
+            elif "ppb" in header_text:
+                unit_text = "ppb"
+
+            elif "wt%" in header_text or "wt %" in header_text:
+                unit_text = "wt%"
+
+            elif "%" in header_text or "percent" in header_text:
+                unit_text = "%"
 
         # ======================================================
         # 14. SAVE ROW
