@@ -503,6 +503,65 @@ def preprocess_variants(crop):
     return [clahe, otsu, adaptive, gray]
 
 
+def preprocess_exact_header_variants(crop):
+    """
+    Header-specific views made from the exact YOLO box on the final
+    (already rotated) image.
+
+    A small inner trim removes the detected rectangle/border lines while
+    retaining all header text. Large Lanczos views help EasyOCR preserve
+    words such as Min/Max when an underline and the % sign are prominent.
+    """
+    if crop is None or crop.size == 0:
+        return []
+
+    height, width = crop.shape[:2]
+    trim_x = max(1, int(width * 0.012))
+    trim_y = max(1, int(height * 0.035))
+
+    if width > 2 * trim_x + 4 and height > 2 * trim_y + 4:
+        inner = crop[trim_y:height - trim_y, trim_x:width - trim_x]
+    else:
+        inner = crop
+
+    gray = (
+        cv2.cvtColor(inner, cv2.COLOR_RGB2GRAY)
+        if inner.ndim == 3
+        else inner.copy()
+    )
+
+    variants = []
+
+    for scale in (5.0, 7.0, 9.0):
+        enlarged = cv2.resize(
+            gray, None, fx=scale, fy=scale,
+            interpolation=cv2.INTER_LANCZOS4
+        )
+        padded = cv2.copyMakeBorder(
+            enlarged, 24, 24, 32, 32,
+            cv2.BORDER_CONSTANT, value=255
+        )
+        denoised = cv2.bilateralFilter(padded, 5, 45, 45)
+        clahe = cv2.createCLAHE(
+            clipLimit=2.2, tileGridSize=(6, 6)
+        ).apply(denoised)
+        blur = cv2.GaussianBlur(clahe, (0, 0), 1.0)
+        sharpened = cv2.addWeighted(clahe, 1.9, blur, -0.9, 0)
+        otsu = cv2.threshold(
+            sharpened, 0, 255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )[1]
+        adaptive = cv2.adaptiveThreshold(
+            sharpened, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 41, 9
+        )
+
+        variants.extend([padded, clahe, sharpened, otsu, adaptive])
+
+    return variants
+
+
 def preprocess_value_variants(crop):
     if crop is None or crop.size == 0:
         return []
@@ -924,6 +983,44 @@ def normalise_value(text):
     if range_match:
         return f"{range_match.group(1)} - {range_match.group(2)}", True
 
+    # ----------------------------------------------------------
+    # RANGE RECOVERY WHEN OCR MISSES THE THIN DASH
+    # ----------------------------------------------------------
+    # EasyOCR can correctly read both numbers in a wide YOLO value
+    # box but drop the small separator, for example:
+    #
+    #     27.00 - 30.00  ->  "27.00 30.00"
+    #
+    # Recover only two clearly separated DECIMAL values. Requiring a
+    # decimal point in both parts prevents an ordinary spaced integer
+    # or thousands-formatted value from being converted into a range.
+
+    missing_dash_match = re.fullmatch(
+        rf"({number_pattern})\s+({number_pattern})",
+        value
+    )
+
+    if missing_dash_match:
+        left_value = missing_dash_match.group(1)
+        right_value = missing_dash_match.group(2)
+
+        if "." in left_value and "." in right_value:
+            return f"{left_value} - {right_value}", True
+
+    # Occasionally the dash is returned as one isolated dot, colon or
+    # semicolon between two otherwise correct decimal values.
+    damaged_dash_match = re.fullmatch(
+        rf"({number_pattern})\s+[.:;]\s+({number_pattern})",
+        value
+    )
+
+    if damaged_dash_match:
+        left_value = damaged_dash_match.group(1)
+        right_value = damaged_dash_match.group(2)
+
+        if "." in left_value and "." in right_value:
+            return f"{left_value} - {right_value}", True
+
     val_no_space = value.replace(" ", "")
     if re.fullmatch(number_pattern, val_no_space):
         return val_no_space, True
@@ -1279,9 +1376,15 @@ def run_easyocr_candidates(reader, variants, allowlist, text_threshold=0.35, low
 def read_fast_header(reader, crop):
     """Fast semantic header OCR; complete category beats a partial word."""
     allowlist = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789%()./_-"
+    exact_header_variants = preprocess_exact_header_variants(crop)
     candidates = run_easyocr_candidates(
-        reader, preprocess_variants(crop), allowlist,
+        reader, preprocess_variants(crop) + exact_header_variants, allowlist,
         text_threshold=0.28, low_text=0.10, link_threshold=0.16
+    )
+    candidates.extend(
+        run_forced_whole_crop_candidates(
+            reader, exact_header_variants, allowlist
+        )
     )
     if not candidates:
         return "", 0.0, False, ""
@@ -1320,6 +1423,7 @@ def read_fast_header(reader, crop):
             "final": final,
             "valid": valid,
             "semantic": final in semantic_headers,
+            "specific_minmax": final.startswith(("Min", "Max")),
             "word_count": len(re.findall(r"[A-Za-z0-9]+", clean_text(item["raw"]))),
         })
     if not prepared:
@@ -1328,6 +1432,7 @@ def read_fast_header(reader, crop):
     best = max(
         prepared,
         key=lambda item: (
+            item["specific_minmax"],
             item["semantic"],
             item["word_count"],
             len(item["final"]),
@@ -1458,7 +1563,10 @@ def read_element_value_advanced(reader, crop):
 
 def read_multiline_header_advanced(reader, crop):
     """Read and combine one- or two-line column headings."""
-    variants = preprocess_advanced_variants(crop)
+    variants = (
+        preprocess_advanced_variants(crop)
+        + preprocess_exact_header_variants(crop)
+    )
     allowlist = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789%./_-"
     candidates = run_easyocr_candidates(
         reader, variants, allowlist,
@@ -1483,6 +1591,7 @@ def read_multiline_header_advanced(reader, crop):
         )
 
         final, _ = normalise_header(raw)
+        is_specific_minmax = final.startswith(("Min", "Max"))
         semantic = final in {
     "Batch",
     "Batch number",
@@ -1508,7 +1617,12 @@ def read_multiline_header_advanced(reader, crop):
 
         prepared.append({
             **item, "raw": raw, "final": final,
-            "category_score": int(semantic) * 6 + int(has_batch or has_lot) * 4 + int(has_number) * 2,
+            "category_score": (
+                int(semantic) * 6
+                + int(is_specific_minmax) * 5
+                + int(has_batch or has_lot) * 4
+                + int(has_number) * 2
+            ),
             "word_score": min(len(words), 4),
         })
 
@@ -2601,7 +2715,9 @@ def parse_single_table_tokens(tokens):
     # When two numeric header regions exist, their horizontal order
     # is more reliable: left = Min and right = Max.
 
-    if len(chemical_headers) >= 2:
+    # Do not invent Min/Max from left/right order alone. The user rule is:
+    # without detected Min/Max text, keep the detection as a normal value.
+    if False and len(chemical_headers) >= 2:
 
         numeric_headers = sorted(
             chemical_headers,
@@ -2648,7 +2764,7 @@ def parse_single_table_tokens(tokens):
     # that next column is the strongest Max candidate.
     # ----------------------------------------------------------
 
-    if min_hdr is not None and max_hdr is None:
+    if False and min_hdr is not None and max_hdr is None:
 
         right_headers = [
             item
@@ -2669,7 +2785,7 @@ def parse_single_table_tokens(tokens):
     # that previous column is the strongest Min candidate.
     # ----------------------------------------------------------
 
-    if max_hdr is not None and min_hdr is None:
+    if False and max_hdr is not None and min_hdr is None:
 
         left_headers = [
             item
@@ -2692,7 +2808,7 @@ def parse_single_table_tokens(tokens):
     # columns remain, left = Min and right = Max.
     # ----------------------------------------------------------
 
-    if (
+    if False and (
         min_hdr is None
         and max_hdr is None
         and len(chemical_headers) >= 2
@@ -2758,72 +2874,283 @@ def parse_single_table_tokens(tokens):
         )
 
     # ==========================================================
+    # HEADER / LIMIT SEMANTIC HELPERS
+    # ==========================================================
+
+    def min_max_kind(det):
+        """Return MIN/MAX only when that meaning exists in OCR text."""
+        combined = (
+            clean_text(det.get("text", ""))
+            + " "
+            + clean_text(det.get("raw_text", ""))
+        ).lower()
+        compact = re.sub(r"[^a-z]", "", combined)
+
+        if any(form in compact for form in (
+            "minimum", "rninimum", "min", "rnin"
+        )):
+            return "MIN"
+
+        if any(form in compact for form in (
+            "maximum", "rnaximum", "max", "rnax"
+        )):
+            return "MAX"
+
+        return None
+
+    def projected_header_for_value(val):
+        """
+        Find a semantic Min/Max header vertically above this exact value.
+        Generic Percentage/unit headers do not create Min/Max semantics.
+        """
+        val_cx = float(val["cx"])
+        val_y1 = float(val["y1"])
+        candidates = []
+
+        for h in headers:
+            kind = min_max_kind(h)
+            if kind is None or float(h["cy"]) >= val_y1:
+                continue
+
+            h_x1 = float(h["x1"])
+            h_x2 = float(h["x2"])
+            # Exact full-box projection. Do not expand into a neighbouring
+            # header column, because that can mix % and ppm semantics.
+            if not (h_x1 <= val_cx <= h_x2):
+                continue
+
+            candidates.append((
+                val_y1 - float(h["y2"]),
+                abs(val_cx - float(h["cx"])),
+                -detection_confidence(h),
+                kind,
+                h,
+            ))
+
+        if not candidates:
+            return None, None
+
+        candidates.sort(key=lambda item: item[:3])
+        return candidates[0][3], candidates[0][4]
+
+    def unit_from_detection(det):
+        text = (
+            clean_text(det.get("text", ""))
+            + " "
+            + clean_text(det.get("raw_text", ""))
+        ).lower()
+        compact = re.sub(r"\s+", "", text)
+
+        if "ppm" in text:
+            return "ppm"
+        if "ppb" in text:
+            return "ppb"
+        if "wt%" in compact or "weight%" in compact:
+            return "wt%"
+        if "%" in text or "percent" in text:
+            return "%"
+        if re.search(r"\bkg\b|kilogram", text):
+            return "kg"
+        if re.search(r"\bmt\b|metric\s*ton", text):
+            return "mt"
+        if re.search(r"\btonnes?\b|\btons?\b", text):
+            return "t"
+        if re.search(r"\bmg\b|milligram", text):
+            return "mg"
+        if re.search(r"\b(?:ug|µg|μg)\b|microgram", text):
+            return "µg"
+        if re.search(r"\bgrams?\b|\bg\b", text):
+            return "g"
+        if re.search(r"\blbs?\b|pounds?", text):
+            return "lb"
+        return None
+
+    def projected_unit_header_for_value(val):
+        """
+        Return the unit from the header region vertically above this
+        exact value. Unit semantics are independent of Min/Max.
+
+        Examples:
+            '% MAXIMA (OR RANGE WHERE SHOWN)' -> %
+            'PPM MAXIMA'                       -> ppm
+            'Max kg'                           -> kg
+        """
+        val_cx = float(val["cx"])
+        val_y1 = float(val["y1"])
+        candidates = []
+
+        for h in headers:
+            header_unit = unit_from_detection(h)
+
+            if header_unit is None or float(h["cy"]) >= val_y1:
+                continue
+
+            h_x1 = float(h["x1"])
+            h_x2 = float(h["x2"])
+            h_width = max(h_x2 - h_x1, 1.0)
+
+            # Use the detected header rectangle exactly as drawn.
+            if not (h_x1 <= val_cx <= h_x2):
+                continue
+
+            candidates.append((
+                max(0.0, val_y1 - float(h["y2"])),
+                h_width,
+                abs(val_cx - float(h["cx"])),
+                -detection_confidence(h),
+                header_unit,
+            ))
+
+        if not candidates:
+            return None
+
+        # Nearest header above wins; a narrower matching header is
+        # preferred when overlapping unit headers are detected.
+        candidates.sort(key=lambda item: item[:4])
+        return candidates[0][4]
+
+    def projected_unit_header_for_region(region):
+        """
+        Inherit a unit from the FULL horizontal size of a header box.
+
+        This works even when a chemical row has no detected value.
+        Every element-symbol column whose horizontal search region lies
+        below a unit header receives that header's unit.
+        """
+        sym = region["symbol"]
+        column_left = float(region["horizontal_left"])
+        column_right = float(region["horizontal_right"])
+        symbol_x = float(sym["cx"])
+        symbol_y1 = float(sym["y1"])
+        candidates = []
+
+        for h in headers:
+            header_unit = unit_from_detection(h)
+
+            if header_unit is None or float(h["cy"]) >= symbol_y1:
+                continue
+
+            h_x1 = float(h["x1"])
+            h_x2 = float(h["x2"])
+
+            # Use the complete detected header rectangle. For the last
+            # symbol column, horizontal_right is infinite, which is safe:
+            # overlap still ends at the header's actual right edge.
+            overlap_left = max(column_left, h_x1)
+            overlap_right = min(column_right, h_x2)
+            overlap = max(0.0, overlap_right - overlap_left)
+            contains_symbol = h_x1 <= symbol_x <= h_x2
+
+            if overlap <= 0.0 and not contains_symbol:
+                continue
+
+            candidates.append((
+                0 if contains_symbol else 1,
+                -overlap,
+                max(0.0, symbol_y1 - float(h["y2"])),
+                abs(symbol_x - float(h["cx"])),
+                -detection_confidence(h),
+                header_unit,
+            ))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[:5])
+        return candidates[0][5]
+
+    # ==========================================================
     # 6. BUILD INTELLIGENT ROW BOUNDARIES
     # ==========================================================
 
     row_regions = []
 
-    for i, sym in enumerate(symbols):
+    # ----------------------------------------------------------
+    # SPLIT SIDE-BY-SIDE ELEMENT-SYMBOL COLUMNS
+    # ----------------------------------------------------------
+    # A certificate can contain two or more chemical sub-tables in
+    # one YOLO table box. Each dense vertical element-symbol column
+    # is an independent horizontal search zone. A value belonging to
+    # the left sub-table must never cross the next symbol column.
 
-        current_y = float(sym["cy"])
+    symbol_widths = [
+        max(float(sym["x2"]) - float(sym["x1"]), 1.0)
+        for sym in symbols
+    ]
+    median_symbol_width = float(np.median(symbol_widths))
+    column_join_distance = max(45.0, median_symbol_width * 2.5)
 
-        # ------------------------------------------------------
-        # UPPER boundary
-        # ------------------------------------------------------
+    symbol_columns = []
 
-        if i == 0:
+    for sym in sorted(symbols, key=lambda item: float(item["cx"])):
+        best_column = None
+        best_distance = float("inf")
 
-            if len(symbols) > 1:
+        for column in symbol_columns:
+            column_center = float(np.median([
+                float(item["cx"]) for item in column
+            ]))
+            distance = abs(float(sym["cx"]) - column_center)
 
-                next_y = float(symbols[i + 1]["cy"])
-                gap = next_y - current_y
+            if distance <= column_join_distance and distance < best_distance:
+                best_column = column
+                best_distance = distance
 
-                upper = current_y - gap / 2.0
-
-            else:
-
-                upper = float(sym["y1"])
-
+        if best_column is None:
+            symbol_columns.append([sym])
         else:
+            best_column.append(sym)
 
-            previous_y = float(symbols[i - 1]["cy"])
+    symbol_columns.sort(
+        key=lambda column: float(np.median([
+            float(item["cx"]) for item in column
+        ]))
+    )
 
-            upper = (
-                previous_y +
-                current_y
-            ) / 2.0
+    for column_index, column_symbols in enumerate(symbol_columns):
+        column_symbols.sort(key=lambda item: float(item["cy"]))
 
-        # ------------------------------------------------------
-        # LOWER boundary
-        # ------------------------------------------------------
-
-        if i == len(symbols) - 1:
-
-            if len(symbols) > 1:
-
-                previous_y = float(symbols[i - 1]["cy"])
-                gap = current_y - previous_y
-
-                lower = current_y + gap / 2.0
-
-            else:
-
-                lower = float(sym["y2"])
-
+        if column_index + 1 < len(symbol_columns):
+            next_symbol_column_left = min(
+                float(item["x1"])
+                for item in symbol_columns[column_index + 1]
+            )
+            # Stop just before the next detected element-symbol column.
+            horizontal_right = next_symbol_column_left - 2.0
         else:
+            horizontal_right = float("inf")
 
-            next_y = float(symbols[i + 1]["cy"])
+        for i, sym in enumerate(column_symbols):
+            current_y = float(sym["cy"])
 
-            lower = (
-                current_y +
-                next_y
-            ) / 2.0
+            if i == 0:
+                if len(column_symbols) > 1:
+                    next_y = float(column_symbols[i + 1]["cy"])
+                    upper = current_y - (next_y - current_y) / 2.0
+                else:
+                    upper = float(sym["y1"])
+            else:
+                previous_y = float(column_symbols[i - 1]["cy"])
+                upper = (previous_y + current_y) / 2.0
 
-        row_regions.append({
-            "symbol": sym,
-            "upper": upper,
-            "lower": lower,
-        })
+            if i == len(column_symbols) - 1:
+                if len(column_symbols) > 1:
+                    previous_y = float(column_symbols[i - 1]["cy"])
+                    lower = current_y + (current_y - previous_y) / 2.0
+                else:
+                    lower = float(sym["y2"])
+            else:
+                next_y = float(column_symbols[i + 1]["cy"])
+                lower = (current_y + next_y) / 2.0
+
+            row_regions.append({
+                "symbol": sym,
+                "upper": upper,
+                "lower": lower,
+                "column_index": column_index,
+                "horizontal_left": float(sym["cx"]),
+                "horizontal_right": horizontal_right,
+            })
 
     # ==========================================================
     # 7. SCORE A DETECTION AGAINST A ROW
@@ -2875,7 +3202,14 @@ def parse_single_table_tokens(tokens):
 
         for i, region in enumerate(row_regions):
 
-            if region["upper"] <= val_y < region["lower"]:
+            sym = region["symbol"]
+
+            if (
+                region["upper"] <= val_y < region["lower"]
+                and float(val["cx"]) > float(sym["cx"])
+                and float(val["x2"]) > float(sym["x2"])
+                and float(val["cx"]) < region["horizontal_right"]
+            ):
 
                 score = row_score(
                     val,
@@ -2921,7 +3255,13 @@ def parse_single_table_tokens(tokens):
 
         for i, region in enumerate(row_regions):
 
-            if region["upper"] <= lim_y < region["lower"]:
+            sym = region["symbol"]
+
+            if (
+                region["upper"] <= lim_y < region["lower"]
+                and float(lim["cx"]) > float(sym["cx"])
+                and float(lim["cx"]) < region["horizontal_right"]
+            ):
 
                 score = row_score(
                     lim,
@@ -2962,7 +3302,13 @@ def parse_single_table_tokens(tokens):
 
         for i, region in enumerate(row_regions):
 
-            if region["upper"] <= unit_y < region["lower"]:
+            sym = region["symbol"]
+
+            if (
+                region["upper"] <= unit_y < region["lower"]
+                and float(unit["cx"]) > float(sym["cx"])
+                and float(unit["cx"]) < region["horizontal_right"]
+            ):
 
                 score = row_score(
                     unit,
@@ -3011,6 +3357,10 @@ def parse_single_table_tokens(tokens):
         val_text = "-"
         min_val = "-"
         max_val = "-"
+        plain_best_score = -1.0
+        min_best_score = -1.0
+        max_best_score = -1.0
+        selected_units = []
 
         # ======================================================
         # 12. CLASSIFY VALUES INTO VALUE / MIN / MAX
@@ -3020,6 +3370,146 @@ def parse_single_table_tokens(tokens):
 
             curr_text = val["text"]
             val_cx = float(val["cx"])
+
+            # --------------------------------------------------
+            # 1. HEADER DIRECTLY ABOVE THIS VALUE
+            # --------------------------------------------------
+
+            value_kind, value_header = projected_header_for_value(val)
+
+            if value_header is not None:
+                header_unit = unit_from_detection(value_header)
+                if header_unit:
+                    selected_units.append(header_unit)
+
+            # Unit-only headers use the same vertical projection but
+            # do not need to contain Min or Max.
+            projected_unit = projected_unit_header_for_value(val)
+            if projected_unit:
+                # Dedicated unit projection takes priority over a unit
+                # inferred indirectly through Min/Max header semantics.
+                selected_units.insert(0, projected_unit)
+
+            # A unit box immediately beside the value is the most
+            # specific evidence and therefore overrides header units.
+            nearby_units = sorted(
+                row_units,
+                key=lambda unit: abs(float(unit["cx"]) - val_cx)
+            )
+
+            if nearby_units:
+                nearest_unit = nearby_units[0]
+                horizontal_gap = max(
+                    0.0,
+                    max(
+                        float(nearest_unit["x1"]) - float(val["x2"]),
+                        float(val["x1"]) - float(nearest_unit["x2"]),
+                    )
+                )
+
+                if horizontal_gap <= 100:
+                    adjacent_unit = unit_from_detection(nearest_unit)
+                    if adjacent_unit:
+                        selected_units.insert(0, adjacent_unit)
+
+            # --------------------------------------------------
+            # 2. NEXT CATEGORIES TO THE RIGHT OF THIS VALUE
+            # --------------------------------------------------
+            # Accepted sequences:
+            #     value -> limit_indicator
+            #     value -> unit -> limit_indicator
+            # A distant or differently ordered Min/Max box is not used.
+
+            right_tokens = [
+                det
+                for det in (row_units + row_limits)
+                if float(det["cx"]) > val_cx
+            ]
+            right_tokens.sort(
+                key=lambda det: (
+                    float(det["x1"]),
+                    float(det["cx"])
+                )
+            )
+
+            right_kind = None
+
+            if right_tokens:
+                first_right = right_tokens[0]
+                first_gap = max(
+                    0.0,
+                    float(first_right["x1"]) - float(val["x2"])
+                )
+
+                # Prevent a Min/Max token from another remote column
+                # being attached to this value.
+                if first_gap <= 220:
+
+                    if first_right["class_name"] == "limit_indicator":
+                        right_kind = min_max_kind(first_right)
+
+                    elif first_right["class_name"] == "unit":
+                        detected_unit = unit_from_detection(first_right)
+                        if detected_unit:
+                            selected_units.insert(0, detected_unit)
+
+                        if len(right_tokens) >= 2:
+                            second_right = right_tokens[1]
+                            second_gap = max(
+                                0.0,
+                                float(second_right["x1"])
+                                - float(first_right["x2"])
+                            )
+
+                            if (
+                                second_gap <= 160
+                                and second_right["class_name"]
+                                == "limit_indicator"
+                            ):
+                                right_kind = min_max_kind(second_right)
+
+            # Header projection has first priority. The immediate
+            # right-side indicator is used only when the header does
+            # not identify the column.
+            final_kind = value_kind or right_kind
+
+            # Inline mathematical signs are explicit limit evidence.
+            if final_kind is None:
+                if "<=" in curr_text or "<" in curr_text:
+                    final_kind = "MAX"
+                elif ">=" in curr_text or ">" in curr_text:
+                    final_kind = "MIN"
+
+            if final_kind == "MIN":
+                current_score = val.get("_row_score", 0)
+                if (
+                    min_val == "-"
+                    or current_score > min_best_score
+                ):
+                    min_val = curr_text
+                    min_best_score = current_score
+
+            elif final_kind == "MAX":
+                current_score = val.get("_row_score", 0)
+                if (
+                    max_val == "-"
+                    or current_score > max_best_score
+                ):
+                    max_val = curr_text
+                    max_best_score = current_score
+
+            else:
+                # No detected Min/Max above or immediately to the
+                # right: this is a normal element value.
+                current_score = val.get("_row_score", 0)
+                if val_text == "-" or current_score > plain_best_score:
+                    val_text = curr_text
+                    plain_best_score = current_score
+
+            # Classification for this value is complete. The legacy
+            # fallback below is intentionally bypassed so it cannot
+            # invent Min/Max merely from left/right value order.
+            continue
 
             near_limit = None
 
@@ -3179,9 +3669,23 @@ def parse_single_table_tokens(tokens):
         # ======================================================
 
         unit_text = "%"
+        region_header_unit = projected_unit_header_for_region(region)
 
-        # An explicit unit detected on this exact row has priority.
-        if row_units:
+        # A unit found immediately to the right of a classified value
+        # has the strongest relationship to that value.
+        if selected_units:
+
+            unit_text = selected_units[0]
+
+        # Otherwise inherit the unit from the complete header box
+        # spanning this element-symbol/value column. This also assigns
+        # units to rows where a value was not detected.
+        elif region_header_unit:
+
+            unit_text = region_header_unit
+
+        # Otherwise use an explicit unit detected on this exact row.
+        elif row_units:
 
             reference_y = float(sym["cy"])
 
